@@ -370,6 +370,7 @@ def main(_):
     pipeline = StableDiffusion3Pipeline.from_pretrained(
         config.pretrained.model
     )
+    pipeline.vae.enable_slicing()
     # freeze parameters of models to save more memory
     pipeline.vae.requires_grad_(False)
     pipeline.text_encoder.requires_grad_(False)
@@ -586,11 +587,10 @@ def main(_):
     # assert config.sample.train_batch_size % config.train.batch_size == 0
     # assert samples_per_epoch % total_train_batch_size == 0
 
-    epoch = 0
     global_step = 0
     train_iter = iter(train_dataloader)
 
-    while True:
+    for epoch in range(config.max_epochs):
         #################### EVAL ####################
         pipeline.transformer.eval()
         if epoch % config.eval_freq == 0:
@@ -740,6 +740,7 @@ def main(_):
             wandb.log(
                 {
                     "epoch": epoch,
+                    "objective_evaluations": samples_per_epoch * (epoch + 1),
                     **{f"reward_{key}": value.mean() for key, value in gathered_rewards.items() if '_strict_accuracy' not in key and '_accuracy' not in key},
                 },
                 step=global_step,
@@ -919,8 +920,6 @@ def main(_):
                     ema.step(transformer_trainable_parameters, global_step)
             # make sure we did an optimization step at the end of the inner epoch
             # assert accelerator.sync_gradients
-        
-        epoch+=1
         
 if __name__ == "__main__":
     app.run(main)

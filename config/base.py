@@ -25,6 +25,7 @@ def get_config():
     config.use_lora = True
     config.dataset = ""
     config.resolution = 768
+    config.max_epochs = 1000
 
     ###### Pretrained Model ######
     config.pretrained = pretrained = ml_collections.ConfigDict()
