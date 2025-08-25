@@ -50,6 +50,14 @@ def sde_step_with_logprob(
     # our sde
     prev_sample_mean = sample*(1+std_dev_t**2/(2*sigma)*dt)+model_output*(1+std_dev_t**2*(1-sigma)/(2*sigma))*dt
     
+    if noise is None:
+        noise = randn_tensor(
+            model_output.shape,
+            generator=generator,
+            device=model_output.device,
+            dtype=model_output.dtype,
+        )
+
     if prev_sample is None:
         prev_sample = prev_sample_mean + std_dev_t * torch.sqrt(-1*dt) * noise
 

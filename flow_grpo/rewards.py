@@ -2,7 +2,11 @@ from PIL import Image
 import io
 import numpy as np
 import torch
+import time
+import functools
+from typing import List
 from collections import defaultdict
+from google.genai.errors import ServerError
 
 def jpeg_incompressibility():
     def _fn(images, prompts, metadata):
@@ -390,6 +394,123 @@ def unifiedreward_score_sglang(device):
     
     return _fn
 
+def retry(times, failed_return, exceptions, backoff_factor=1):
+    """
+    Retry Decorator
+    Retries the wrapped function/method `times` times if the exceptions listed
+    in ``exceptions`` are thrown
+    :param times: The number of times to repeat the wrapped function/method
+    :type times: Int
+    :param Exceptions: Lists of exceptions that trigger a retry attempt
+    :type Exceptions: Tuple of Exceptions
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            attempt = 0
+            while attempt < times:
+                try:
+                    return func(*args, **kwargs, retry_attempt=attempt)
+                except exceptions as e:
+                    print(
+                        f"Exception [{type(e)}:{e}] thrown when attempting to run {func}, attempt {attempt} of {times}"
+                    )
+                    time.sleep(backoff_factor * 2**attempt)
+                    attempt += 1
+            return failed_return
+        return wrapper
+    return decorator
+
+def gemini_score():
+    """Uses Gemini API to score image alignment to a hardcoded instruction.
+
+    Assumptions:
+    - metadata is unused (can be empty dict)
+    - A fixed question is used for all images.
+    - Returns a numeric score per image (0 or 1) parsed from model output pattern @answer=<0|1>.
+    """
+    import io
+    import re
+    import inspect
+    from PIL import Image
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client()
+
+    safety_settings = [
+        types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+        types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+        types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+        types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+        types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+    ]
+
+    question_template = inspect.cleandoc("""
+        Determine if the image accurately adheres to the prompt: "{prompt}"?
+        Rate it from 1 (least-accurate) to 5 (most-accurate).
+        Response in format: @answer=rating
+    """)
+
+    answer_pattern = re.compile(r"@answer=\(?(\d+)\)?")
+
+    @retry(times=10, failed_return=None, exceptions=(ServerError, ValueError))
+    def _score_single(image_array, prompt, retry_attempt):
+        # image_array is HWC uint8
+        pil_img = Image.fromarray(image_array).convert("RGB").resize((128, 128))
+        buf = io.BytesIO()
+        pil_img.save(buf, format="JPEG")
+        image_part = types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg")
+
+        gen_config = types.GenerateContentConfig(
+            temperature=0.0 if retry_attempt == 0 else 0.3,
+            safety_settings=safety_settings,
+            thinking_config=types.ThinkingConfig(thinking_budget=512, include_thoughts=False),
+        )
+        
+        question = question_template.format(prompt=prompt)
+
+        response = client.models.generate_content(
+            model="gemini-2.5-flash-lite",
+            contents=[image_part, question],
+            config=gen_config,
+        )
+        match = answer_pattern.search(response.text)
+        if match:
+            return float(match.group(1))
+        else:
+            raise ValueError(f"Gemini response did not match expected pattern: {response.text}")
+
+    def _fn(images, prompts, metadata):  # metadata ignored
+        if isinstance(images, torch.Tensor):
+            # Convert NCHW float [0,1] or other to uint8 HWC list
+            np_imgs = (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
+            np_imgs = np_imgs.transpose(0, 2, 3, 1)
+        else:
+            # assume numpy batch HWC already
+            np_imgs = images
+        scores = [ _score_single(img, prompt) for img, prompt in zip(np_imgs, prompts) ]
+        return scores, {}
+
+    return _fn
+
+def gemma_score(device):
+    from flow_grpo.prompt_align_scorer import GemmaScorer
+    scorer = GemmaScorer(device=device)
+    def _fn(images, prompts, metadata):
+
+        if isinstance(images, torch.Tensor):
+            np_imgs = (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
+            np_imgs = np_imgs.transpose(0, 2, 3, 1)
+        else:
+            np_imgs = images
+        
+        pil_imgs = [Image.fromarray(img).convert("RGB") for img in np_imgs]
+
+        return scorer(pil_imgs, prompts, metadata)
+    return _fn
+
+
 def multi_score(device, score_dict):
     score_functions = {
         "deqa": deqa_score_remote,
@@ -403,6 +524,8 @@ def multi_score(device, score_dict):
         "geneval": geneval_score,
         "clipscore": clip_score,
         "image_similarity": image_similarity_score,
+        "gemini": gemini_score,
+        "gemma": gemma_score,
     }
     score_fns={}
     for score_name, weight in score_dict.items():
@@ -412,6 +535,7 @@ def multi_score(device, score_dict):
     def _fn(images, prompts, metadata, ref_images=None, only_strict=True):
         total_scores = []
         score_details = {}
+        output_metadatas = {}
         
         for score_name, weight in score_dict.items():
             if score_name == "geneval":
@@ -422,12 +546,14 @@ def multi_score(device, score_dict):
                     score_details[f'{key}_strict_accuracy'] = value
                 for key, value in group_rewards.items():
                     score_details[f'{key}_accuracy'] = value
+                meta = {}
             elif score_name == "image_similarity":
-                scores, rewards = score_fns[score_name](images, ref_images)
+                scores, meta = score_fns[score_name](images, ref_images)
             else:
-                scores, rewards = score_fns[score_name](images, prompts, metadata)
+                scores, meta = score_fns[score_name](images, prompts, metadata)
             score_details[score_name] = scores
             weighted_scores = [weight * score for score in scores]
+            output_metadatas[score_name] = meta
             
             if not total_scores:
                 total_scores = weighted_scores
@@ -435,7 +561,7 @@ def multi_score(device, score_dict):
                 total_scores = [total + weighted for total, weighted in zip(total_scores, weighted_scores)]
         
         score_details['avg'] = total_scores
-        return score_details, {}
+        return score_details, output_metadatas
 
     return _fn
 

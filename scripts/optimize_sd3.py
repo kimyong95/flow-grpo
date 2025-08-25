@@ -54,14 +54,17 @@ class TextPromptDataset(Dataset):
         return len(self.prompts)
     
     def __getitem__(self, idx):
-        return {"prompt": self.prompts[idx], "metadata": {}}
-
+        return (idx, self.prompts[idx], {})
+    
     @staticmethod
-    def collate_fn(examples):
-        prompts = [example["prompt"] for example in examples]
-        metadatas = [example["metadata"] for example in examples]
-        return prompts, metadatas
-
+    def collate_fn(batch):
+        # batch: list of (idx, prompt_str, metadata_dict)
+        idxs, prompts, metas = zip(*batch)
+        idxs = list(idxs)
+        prompts = list(prompts)
+        metas = list(metas)
+        return idxs, prompts, metas
+    
 class GenevalPromptDataset(Dataset):
     def __init__(self, dataset, split='train'):
         self.file_path = os.path.join(dataset, f'{split}_metadata.jsonl')
@@ -73,13 +76,16 @@ class GenevalPromptDataset(Dataset):
         return len(self.prompts)
     
     def __getitem__(self, idx):
-        return {"prompt": self.prompts[idx], "metadata": self.metadatas[idx]}
+        return (idx, self.prompts[idx], self.metadatas[idx])
 
     @staticmethod
-    def collate_fn(examples):
-        prompts = [example["prompt"] for example in examples]
-        metadatas = [example["metadata"] for example in examples]
-        return prompts, metadatas
+    def collate_fn(batch):
+        # batch: list of (idx, prompt_str, metadata_dict)
+        idxs, prompts, metas = zip(*batch)
+        idxs = list(idxs)
+        prompts = list(prompts)
+        metas = list(metas)
+        return idxs, prompts, metas
 
 class DistributedKRepeatSampler(Sampler):
     def __init__(self, dataset, batch_size, k, num_replicas, rank, seed=0):
@@ -220,21 +226,27 @@ def compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, co
 
     return prev_sample, log_prob, prev_sample_mean, std_dev_t
 
-def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, reward_fn, executor, autocast, num_train_timesteps):
+def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, reward_fn, autocast, num_train_timesteps, mu, sigma):
+    
+    unflatten = lambda x: einops.rearrange(x, "... (c h w) -> ... c h w", c=pipeline.transformer.config.in_channels, h=int(config.resolution/pipeline.vae_scale_factor), w=int(config.resolution/pipeline.vae_scale_factor))
+
     neg_prompt_embed, neg_pooled_prompt_embed = compute_text_embeddings([""], text_encoders, tokenizers, max_sequence_length=128, device=accelerator.device)
 
     sample_neg_prompt_embeds = neg_prompt_embed.repeat(config.sample.test_batch_size, 1, 1)
     sample_neg_pooled_prompt_embeds = neg_pooled_prompt_embed.repeat(config.sample.test_batch_size, 1)
 
     # test_dataloader = itertools.islice(test_dataloader, 2)
-    all_rewards = defaultdict(list)
+    all_rewards = []
+    all_images = []
+    all_prompts = []
+    
     for test_batch in tqdm(
             test_dataloader,
             desc="Eval: ",
             disable=not accelerator.is_local_main_process,
             position=0,
         ):
-        prompts, prompt_metadata = test_batch
+        prompts_idx, prompts, prompt_metadata = test_batch
         prompt_embeds, pooled_prompt_embeds = compute_text_embeddings(
             prompts, 
             text_encoders, 
@@ -246,9 +258,13 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
         if len(prompt_embeds)<len(sample_neg_prompt_embeds):
             sample_neg_prompt_embeds = sample_neg_prompt_embeds[:len(prompt_embeds)]
             sample_neg_pooled_prompt_embeds = sample_neg_pooled_prompt_embeds[:len(prompt_embeds)]
+
+        latents = torch.load("dataset/eval_latents/tensor.pt")[prompts_idx]
+        _, noise_projected = get_noise(mu, sigma, config.sample.test_batch_size, accelerator.device)
+
         with autocast():
             with torch.inference_mode():
-                images, _, _ = pipeline_with_logprob(
+                images, _, _, _ = pipeline_with_logprob(
                     pipeline,
                     prompt_embeds=prompt_embeds,
                     pooled_prompt_embeds=pooled_prompt_embeds,
@@ -259,66 +275,59 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
                     output_type="pt",
                     height=config.resolution,
                     width=config.resolution, 
-                    noise_level=0,
+                    noise_level=config.sample.noise_level,
+                    noise=unflatten(noise_projected),
+                    latents=latents,
                 )
                 images = images.to(accelerator.device, dtype=torch.float32)
-        rewards = executor.submit(reward_fn, images, prompts, prompt_metadata, only_strict=False)
-        # yield to to make sure reward computation starts
-        time.sleep(0)
-        rewards, reward_metadata = rewards.result()
-
-        for key, value in rewards.items():
-            rewards_gather = accelerator.gather(torch.as_tensor(value, device=accelerator.device)).cpu().numpy()
-            all_rewards[key].append(rewards_gather)
+        
+        rewards, reward_metadata = reward_fn(images, prompts, prompt_metadata, only_strict=False)
+        
+        all_rewards.append(rewards)
+        all_images.append(images)
+        all_prompts.extend(prompts)
     
-    last_batch_images_gather = accelerator.gather(torch.as_tensor(images, device=accelerator.device)).cpu().numpy()
-    last_batch_prompt_ids = tokenizers[0](
-        prompts,
+    
+    prompts_ids = tokenizers[0](
+        all_prompts,
         padding="max_length",
         max_length=256,
         truncation=True,
         return_tensors="pt",
     ).input_ids.to(accelerator.device)
-    last_batch_prompt_ids_gather = accelerator.gather(last_batch_prompt_ids).cpu().numpy()
-    last_batch_prompts_gather = pipeline.tokenizer.batch_decode(
-        last_batch_prompt_ids_gather, skip_special_tokens=True
+    gathered_prompts_ids = accelerator.gather(prompts_ids).cpu().numpy()
+    gathered_prompts = pipeline.tokenizer.batch_decode(
+        gathered_prompts_ids, skip_special_tokens=True
     )
-    last_batch_rewards_gather = {}
-    for key, value in rewards.items():
-        last_batch_rewards_gather[key] = accelerator.gather(torch.as_tensor(value, device=accelerator.device)).cpu().numpy()
 
-    all_rewards = {key: np.concatenate(value) for key, value in all_rewards.items()}
+    gathered_images = accelerator.gather(torch.concat(all_images))
+    
+    all_rewards = {k: torch.cat([torch.tensor(d[k], device=accelerator.device) for d in all_rewards], dim=0) for k in all_rewards[0]}
+    gathered_rewards = {key: accelerator.gather(value) for key, value in all_rewards.items()}
+
     if accelerator.is_main_process:
         with tempfile.TemporaryDirectory() as tmpdir:
-            num_samples = min(15, len(last_batch_images_gather))
-            # sample_indices = random.sample(range(len(images)), num_samples)
-            sample_indices = range(num_samples)
-            for idx, index in enumerate(sample_indices):
-                image = last_batch_images_gather[index]
+            for i in range(len(gathered_images)):
+                image = gathered_images[i]
                 pil = Image.fromarray(
-                    (image.transpose(1, 2, 0) * 255).astype(np.uint8)
+                    (image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
                 )
                 pil = pil.resize((config.resolution, config.resolution))
-                pil.save(os.path.join(tmpdir, f"{idx}.jpg"))
-            sampled_prompts = [last_batch_prompts_gather[index] for index in sample_indices]
-            sampled_rewards = [{k: last_batch_rewards_gather[k][index] for k in last_batch_rewards_gather} for index in sample_indices]
-            for key, value in all_rewards.items():
-                print(key, value.shape)
+                pil.save(os.path.join(tmpdir, f"{i}.jpg"))
+        
             wandb.log(
                 {
                     "eval_images": [
                         wandb.Image(
                             os.path.join(tmpdir, f"{idx}.jpg"),
-                            caption=f"{prompt:.1000} | " + " | ".join(f"{k}: {v:.2f}" for k, v in reward.items() if v != -10),
+                            caption=f"{prompt:.100} | avg: {avg_reward:.2f}",
                         )
-                        for idx, (prompt, reward) in enumerate(zip(sampled_prompts, sampled_rewards))
+                        for idx, (prompt, avg_reward) in enumerate(zip(gathered_prompts, gathered_rewards["avg"]))
                     ],
-                    **{f"eval_reward_{key}": np.mean(value[value != -10]) for key, value in all_rewards.items()},
+                    **{f"eval_reward_{key}": value.mean() for key, value in gathered_rewards.items()},
                 },
                 step=global_step,
             )
-    if config.train.ema:
-        ema.copy_temp_to(transformer_trainable_parameters)
 
 def unwrap_model(model, accelerator):
     model = accelerator.unwrap_model(model)
@@ -451,7 +460,8 @@ def main(_):
     pipeline.text_encoder_2.requires_grad_(False)
     pipeline.text_encoder_3.requires_grad_(False)
     pipeline.transformer.requires_grad_(False)
-    pipeline.transformer = torch.compile(pipeline.transformer)
+    if config.compile:
+        pipeline.transformer = torch.compile(pipeline.transformer)
 
     text_encoders = [pipeline.text_encoder, pipeline.text_encoder_2, pipeline.text_encoder_3]
     tokenizers = [pipeline.tokenizer, pipeline.tokenizer_2, pipeline.tokenizer_3]
@@ -485,7 +495,6 @@ def main(_):
 
     # prepare prompt and reward fn
     reward_fn = getattr(flow_grpo.rewards, 'multi_score')(accelerator.device, config.reward_fn)
-    eval_reward_fn = getattr(flow_grpo.rewards, 'multi_score')(accelerator.device, config.reward_fn)
 
     if config.prompt_fn == "general_ocr":
         train_dataset = TextPromptDataset(config.dataset, 'train')
@@ -570,10 +579,6 @@ def main(_):
     # Prepare everything with our `accelerator`.
     train_dataloader, test_dataloader = accelerator.prepare(train_dataloader, test_dataloader)
 
-    # executor to perform callbacks asynchronously. this is beneficial for the llava callbacks which makes a request to a
-    # remote server running llava inference.
-    executor = futures.ThreadPoolExecutor(max_workers=8)
-
     # Train!
     samples_per_epoch = (
         config.sample.train_batch_size
@@ -620,16 +625,18 @@ def main(_):
     value_model.to(accelerator.device)
 
     for epoch in range(config.max_epochs):
+        pipeline.transformer.eval()
+
         #################### EVAL ####################
-        # pipeline.transformer.eval()
-        # if epoch % config.eval_freq == 0:
-        #     eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, eval_reward_fn, executor, autocast, num_train_timesteps)
+        if config.eval_freq > 0 and epoch % config.eval_freq == 0:
+            eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, reward_fn, autocast, num_train_timesteps, mu, sigma)
 
         #################### SAMPLING ####################
         noise, noise_projected = get_noise(mu, sigma, config.sample.train_batch_size, accelerator.device)
-        pipeline.transformer.eval()
         samples = []
         prompts = []
+        images_list = []
+        prompts_list = []
         for i in tqdm(
             range(config.sample.num_batches_per_epoch),
             desc=f"Epoch {epoch}: sampling",
@@ -637,7 +644,7 @@ def main(_):
             position=0,
         ):
             train_sampler.set_epoch(epoch * config.sample.num_batches_per_epoch + i)
-            prompts, prompt_metadata = next(train_iter)
+            prompts_idx, prompts, prompt_metadata = next(train_iter)
 
             prompt_embeds, pooled_prompt_embeds = compute_text_embeddings(
                 prompts, 
@@ -660,7 +667,7 @@ def main(_):
             else:
                 generator = None
             with autocast():
-                with torch.no_grad():
+                with torch.inference_mode():
                     images, latents, log_probs, pred_samples = pipeline_with_logprob(
                         pipeline,
                         prompt_embeds=prompt_embeds,
@@ -690,11 +697,6 @@ def main(_):
                 config.sample.train_batch_size, 1
             )  # (batch_size, num_steps)
 
-            # compute rewards asynchronously
-            rewards = executor.submit(reward_fn, images, prompts, prompt_metadata, only_strict=True)
-            # yield to to make sure reward computation starts
-            time.sleep(0)
-
             samples.append(
                 {
                     "prompt_ids": prompt_ids,
@@ -711,9 +713,10 @@ def main(_):
                         :, 1:
                     ],  # each entry is the predicted sample after timestep t
                     "log_probs": log_probs,
-                    "rewards": rewards,
                 }
             )
+            images_list.append(images)
+            prompts_list.append(prompts)
 
         # wait for all rewards to be computed
         for sample in tqdm(
@@ -722,7 +725,7 @@ def main(_):
             disable=not accelerator.is_local_main_process,
             position=0,
         ):
-            rewards, reward_metadata = sample["rewards"].result()
+            rewards, reward_metadata = reward_fn(images, prompts, prompt_metadata, only_strict=True)
             # accelerator.print(reward_metadata)
             sample["rewards"] = {
                 key: torch.as_tensor(value, device=accelerator.device).float()
@@ -740,35 +743,6 @@ def main(_):
             for k in samples[0].keys()
         }
 
-        if accelerator.is_main_process:
-            # this is a hack to force wandb to log the images as JPEGs instead of PNGs
-            with tempfile.TemporaryDirectory() as tmpdir:
-                num_samples = min(15, len(images))
-                sample_indices = random.sample(range(len(images)), num_samples)
-
-                for idx, i in enumerate(sample_indices):
-                    image = images[i]
-                    pil = Image.fromarray(
-                        (image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
-                    )
-                    pil = pil.resize((config.resolution, config.resolution))
-                    pil.save(os.path.join(tmpdir, f"{idx}.jpg"))  # 使用新的索引
-
-                sampled_prompts = [prompts[i] for i in sample_indices]
-                sampled_rewards = [rewards['avg'][i] for i in sample_indices]
-
-                wandb.log(
-                    {
-                        "images": [
-                            wandb.Image(
-                                os.path.join(tmpdir, f"{idx}.jpg"),
-                                caption=f"{prompt:.100} | avg: {avg_reward:.2f}",
-                            )
-                            for idx, (prompt, avg_reward) in enumerate(zip(sampled_prompts, sampled_rewards))
-                        ],
-                    },
-                    step=global_step,
-                )
         samples["rewards"]["ori_avg"] = samples["rewards"]["avg"]
         # The purpose of repeating `adv` along the timestep dimension here is to make it easier to introduce timestep-dependent advantages later, such as adding a KL reward.
         samples["rewards"]["avg"] = samples["rewards"]["avg"].unsqueeze(1).repeat(1, num_train_timesteps)
@@ -781,13 +755,55 @@ def main(_):
                 {
                     "epoch": epoch,
                     "objective_evaluations": samples_per_epoch * (epoch + 1),
-                    **{f"reward_{key}": value.mean() for key, value in gathered_rewards.items() if '_strict_accuracy' not in key and '_accuracy' not in key},
+                    **{f"reward_{key}": value.mean() for key, value in gathered_rewards.items()},
                 },
                 step=global_step,
             )
 
+
+        gathered_images = accelerator.gather(torch.as_tensor(torch.cat(images_list, dim=0), device=accelerator.device))
+        prompts_ids = tokenizers[0](
+            prompts,
+            padding="max_length",
+            max_length=256,
+            truncation=True,
+            return_tensors="pt",
+        ).input_ids.to(accelerator.device)
+        gathered_prompts_ids = accelerator.gather(prompts_ids).cpu().numpy()
+        gathered_prompts = pipeline.tokenizer.batch_decode(
+            gathered_prompts_ids, skip_special_tokens=True
+        )
+
+        if accelerator.is_main_process:
+            # this is a hack to force wandb to log the images as JPEGs instead of PNGs
+            with tempfile.TemporaryDirectory() as tmpdir:
+
+                for i in range(len(gathered_images)):
+                    image = gathered_images[i]
+                    pil = Image.fromarray(
+                        (image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+                    )
+                    pil = pil.resize((config.resolution, config.resolution))
+                    pil.save(os.path.join(tmpdir, f"{i}.jpg"))
+
+                wandb.log(
+                    {
+                        "images": [
+                            wandb.Image(
+                                os.path.join(tmpdir, f"{idx}.jpg"),
+                                caption=f"{prompt:.100} | avg: {avg_reward:.2f}",
+                            )
+                            for idx, (prompt, avg_reward) in enumerate(zip(gathered_prompts, gathered_rewards["ori_avg"]))
+                        ],
+                    },
+                    step=global_step,
+                )
+
         #################### TRAINING ####################
         gathered_pred_samples = accelerator.gather(samples["next_pred_samples"])
+        _noise = einops.rearrange(noise, "T B D -> B T D")
+        _gathered_noise = accelerator.gather(_noise)
+        gathered_noise = einops.rearrange(_gathered_noise, "B T D -> T B D")
         assert samples_per_epoch == len(gathered_rewards["ori_avg"])
         if accelerator.is_main_process:
             all_rewards = torch.zeros((config.sample.num_steps, samples_per_epoch), device=accelerator.device)
@@ -800,9 +816,6 @@ def main(_):
                 all_rewards[t, :] = pred_y_mean
             
             all_objective_values = - all_rewards
-            _noise = einops.rearrange(noise, "T B D -> B T D")
-            _gathered_noise = accelerator.gather_for_metrics(_noise)
-            gathered_noise = einops.rearrange(_gathered_noise, "B T D -> T B D")
             mu, sigma = update_parameters(mu, sigma, gathered_noise, all_objective_values)
         
         mu = accelerate.utils.broadcast(mu)

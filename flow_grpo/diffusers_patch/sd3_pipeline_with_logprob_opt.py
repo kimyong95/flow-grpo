@@ -2,7 +2,7 @@
 # with the following modifications:
 # - It uses the patched version of `sde_step_with_logprob` from `sd3_sde_with_logprob_opt.py`.
 # - It returns all the intermediate latents of the denoising process as well as the log probs of each denoising step.
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 import torch
 from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import retrieve_timesteps
 from .sd3_sde_with_logprob_opt import sde_step_with_logprob
@@ -32,6 +32,7 @@ def pipeline_with_logprob(
     joint_attention_kwargs: Optional[Dict[str, Any]] = None,
     clip_skip: Optional[int] = None,
     callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+    step_function_callback: Optional[Callable] = None,
     max_sequence_length: int = 256,
     skip_layer_guidance_scale: float = 2.8,
     noise_level: float = 0.7,
@@ -160,7 +161,9 @@ def pipeline_with_logprob(
                 
             latents_dtype = latents.dtype
 
-            latents, log_prob, prev_latents_mean, std_dev_t, pred_sample = sde_step_with_logprob(
+            step_function = step_function_callback if step_function_callback is not None else sde_step_with_logprob
+
+            latents, log_prob, prev_latents_mean, std_dev_t, pred_sample = step_function(
                 self.scheduler, 
                 noise_pred.float(), 
                 t.unsqueeze(0), 
@@ -168,13 +171,15 @@ def pipeline_with_logprob(
                 noise_level=noise_level,
                 noise=noise[i] if noise is not None else None,
             )
-            
+
             all_latents.append(latents)
             all_log_probs.append(log_prob)
             all_pred_samples.append(pred_sample)
             if latents.dtype != latents_dtype:
                 latents = latents.to(latents_dtype)
             
+
+
             # call the callback, if provided
             if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                 progress_bar.update()
