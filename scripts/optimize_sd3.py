@@ -188,43 +188,6 @@ def create_generator(prompts, base_seed):
         generators.append(gen)
     return generators
 
-        
-def compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, config):
-    if config.train.cfg:
-        noise_pred = transformer(
-            hidden_states=torch.cat([sample["latents"][:, j]] * 2),
-            timestep=torch.cat([sample["timesteps"][:, j]] * 2),
-            encoder_hidden_states=embeds,
-            pooled_projections=pooled_embeds,
-            return_dict=False,
-        )[0]
-        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-        noise_pred_uncond = noise_pred_uncond.detach()
-        noise_pred = (
-            noise_pred_uncond
-            + config.sample.guidance_scale
-            * (noise_pred_text - noise_pred_uncond)
-        )
-    else:
-        noise_pred = transformer(
-            hidden_states=sample["latents"][:, j],
-            timestep=sample["timesteps"][:, j],
-            encoder_hidden_states=embeds,
-            pooled_projections=pooled_embeds,
-            return_dict=False,
-        )[0]
-    
-    # compute the log prob of next_latents given latents under the current model
-    prev_sample, log_prob, prev_sample_mean, std_dev_t = sde_step_with_logprob(
-        pipeline.scheduler,
-        noise_pred.float(),
-        sample["timesteps"][:, j],
-        sample["latents"][:, j].float(),
-        prev_sample=sample["next_latents"][:, j].float(),
-        noise_level=config.sample.noise_level,
-    )
-
-    return prev_sample, log_prob, prev_sample_mean, std_dev_t
 
 def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, reward_fn, autocast, num_train_timesteps, mu, sigma):
     
@@ -320,7 +283,7 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
                     "eval_images": [
                         wandb.Image(
                             os.path.join(tmpdir, f"{idx}.jpg"),
-                            caption=f"{prompt:.100} | avg: {avg_reward:.2f}",
+                            caption=f"{prompt} | avg: {avg_reward:.2f}",
                         )
                         for idx, (prompt, avg_reward) in enumerate(zip(gathered_prompts, gathered_rewards["avg"]))
                     ],
@@ -451,7 +414,8 @@ def main(_):
 
     # load scheduler, tokenizer and models.
     pipeline = StableDiffusion3Pipeline.from_pretrained(
-        config.pretrained.model
+        config.pretrained.model,
+        torch_dtype=torch.bfloat16,
     )
     pipeline.vae.enable_slicing()
     # freeze parameters of models to save more memory
@@ -791,7 +755,7 @@ def main(_):
                         "images": [
                             wandb.Image(
                                 os.path.join(tmpdir, f"{idx}.jpg"),
-                                caption=f"{prompt:.100} | avg: {avg_reward:.2f}",
+                                caption=f"{prompt} | avg: {avg_reward:.2f}",
                             )
                             for idx, (prompt, avg_reward) in enumerate(zip(gathered_prompts, gathered_rewards["ori_avg"]))
                         ],
