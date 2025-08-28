@@ -1,0 +1,17 @@
+name: grpo
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10.16
+  - gcc_linux-64
+  - gxx_linux-64
+  - nvidia/label/cuda-12.6.3::cuda-toolkit
+  - pip
+  - pip:
+    - --extra-index-url https://download.pytorch.org/whl/cu126
+    - -e .
+    - paddlepaddle-gpu==2.6.2
+    - paddleocr==2.9.1
+    - python-Levenshtein
+    - google-genai
