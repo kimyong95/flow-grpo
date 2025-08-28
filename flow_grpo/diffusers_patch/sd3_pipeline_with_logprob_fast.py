@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Union
 import torch
 import random
 from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import retrieve_timesteps
-from .sd3_sde_with_logprob_s1 import sde_step_with_logprob
+from .sd3_sde_with_logprob import sde_step_with_logprob
 
 @torch.no_grad()
 def pipeline_with_logprob(
@@ -38,6 +38,7 @@ def pipeline_with_logprob(
     noise_level: float = 0.7,
     train_num_steps: int = 1,
     process_index: int = 0,
+    sample_num_steps: int = 10,
     random_timestep: Optional[int] = None,
 ):
     height = height or self.default_sample_size * self.vae_scale_factor
@@ -52,6 +53,7 @@ def pipeline_with_logprob(
         width,
         negative_prompt=negative_prompt,
         negative_prompt_2=negative_prompt_2,
+        negative_prompt_3=negative_prompt_3,
         prompt_embeds=prompt_embeds,
         negative_prompt_embeds=negative_prompt_embeds,
         pooled_prompt_embeds=pooled_prompt_embeds,
@@ -90,6 +92,7 @@ def pipeline_with_logprob(
         prompt_3=prompt_3,
         negative_prompt=negative_prompt,
         negative_prompt_2=negative_prompt_2,
+        negative_prompt_3=negative_prompt_3,
         do_classifier_free_guidance=self.do_classifier_free_guidance,
         prompt_embeds=prompt_embeds,
         negative_prompt_embeds=negative_prompt_embeds,
@@ -112,7 +115,7 @@ def pipeline_with_logprob(
         device,
         generator,
         latents,
-    )
+    ).float()
 
     # 5. Prepare timesteps
     scheduler_kwargs = {}
@@ -128,7 +131,7 @@ def pipeline_with_logprob(
 
     random.seed(process_index)
     if random_timestep is None:
-        random_timestep = random.randint(0, 1)
+        random_timestep = random.randint(0, sample_num_steps//2)
 
 
     # 6. Prepare image embeddings
@@ -172,7 +175,7 @@ def pipeline_with_logprob(
                 joint_attention_kwargs=self.joint_attention_kwargs,
                 return_dict=False,
             )[0]
-            noise_pred = noise_pred.to(prompt_embeds.dtype)
+            # noise_pred = noise_pred.to(prompt_embeds.dtype)
             # perform guidance
             if self.do_classifier_free_guidance:
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
@@ -188,8 +191,8 @@ def pipeline_with_logprob(
                 noise_level=cur_noise_level,
             )
                 
-            if latents.dtype != latents_dtype:
-                latents = latents.to(latents_dtype)
+            # if latents.dtype != latents_dtype:
+            #     latents = latents.to(latents_dtype)
             
             if i >= random_timestep and i < random_timestep + train_num_steps:
                 all_latents.append(latents)

@@ -9,6 +9,18 @@
 
 ## Changelog
 
+**2025-08-15**
+
+* Thanks [Jing Wang](https://scholar.google.com.hk/citations?user=Q9Np_KQAAAAJ&hl=zh-CN) for adding **Wan2.1**. Training command
+```bash
+accelerate launch --config_file scripts/accelerate_configs/multi_gpu.yaml --num_processes=1 --main_process_port 29503 scripts/train_wan2_1.py --config config/grpo.py:general_ocr_wan2_1
+```
+
+**2025-08-14**
+
+* Adding reward curve of Flow-GRPO-Fast vs. Flow-GRPO. In Pickscore reward, Flow-GRPO-Fast is comparable to Flow-GRPO with only 2 steps training.
+
+
 **2025-08-04**
 
 * Adding support for **FLUX.1-Kontext-dev**. For the counting task, we use Geneval reward to detect object counts and CLIP feature similarity to ensure consistency between the original and edited images. This implementation offers a runnable pipeline, but the training set contains only 800 samples. Making Flow-GRPO truly effective for editing tasks still requires further exploration by the community.
@@ -16,7 +28,7 @@
 
 **2025-07-31**
 
-- Adding Flow-GRPO-S1.
+- Adding Flow-GRPO-Fast.
 
 **2025-07-28**
 
@@ -29,20 +41,33 @@
 - 🔥We showcase image examples from three tasks and their training evolution at https://gongyeliu.github.io/Flow-GRPO. Check them out!
 - 🔥We now provide an online demo for all three tasks at https://huggingface.co/spaces/jieliu/SD3.5-M-Flow-GRPO. You're welcome to try it out!
 
-## Flow-GRPO-S1
-We propose Flow-GRPO-S1, an accelerated variant of Flow-GRPO that requires training on **only a single denoising step** per trajectory. For each prompt, we first generate a deterministic trajectory using ODE sampling. At a randomly chosen intermediate step, we inject noise and switch to SDE sampling to generate a group. The rest of the process continues with ODE sampling. This confines stochasticity to a single step, allowing training to focus solely on that step. This one-step training idea was primarily proposed by [Ziyang Yuan](https://scholar.google.com/citations?user=fWxWEzsAAAAJ&hl=en) during our discussions in early June. 
+## FAQ
 
-Flow-GRPO-S1 achieves significant efficiency gains:
+* Please use **fp16** for training whenever possible, as it provides higher precision than bf16, resulting in smaller log-probability errors between data collection and training. For Flux and Wan, becauase fp16 inference cannot produce valid images or videos, you will have to use **bf16** for training. Note that log-probability errors tend to be smaller at high-noise steps and larger at low-noise steps. Training only on high-noise steps yields better results in this case. Thanks to [Jing Wang](https://scholar.google.com.hk/citations?user=Q9Np_KQAAAAJ&hl=zh-CN) for these observations.
 
-- Each trajectory is trained only once, reducing the training cost by approximately a factor of num_steps.
+* When using **Flow-GRPO-Fast**, set a relatively small `clip_range`, otherwise training may crash.
+
+* When implementing a new model, please check whether using different batch sizes leads to slight differences in the output. SD3 has this issue, which is why I ensure that the batch size for training is the same as that used for data collection.
+
+
+## Flow-GRPO-Fast
+We propose Flow-GRPO-Fast, an accelerated variant of Flow-GRPO that requires training on **only one or two denoising step** per trajectory. For each prompt, we first generate a deterministic trajectory using ODE sampling. At a randomly chosen intermediate step, we inject noise and switch to SDE sampling to generate a group. The rest of the process continues with ODE sampling. This confines stochasticity to one or two steps, allowing training to focus solely on that steps. This few-step training idea was primarily proposed by [Ziyang Yuan](https://scholar.google.com/citations?user=fWxWEzsAAAAJ&hl=en) during our discussions in early June. 
+
+Flow-GRPO-Fast achieves significant efficiency gains:
+
+- Each trajectory is trained only once or twice, significantly reducing the training cost.
 
 - Sampling before branching requires only a single prompt without group expansion, further speeding up data collection.
 
-Experiments on PickScore show that Flow-GRPO-S1 matches the reward performance of Flow-GRPO while offering 5–10× faster training. 
+Experiments on PickScore show that Flow-GRPO-Fast matches the reward performance of Flow-GRPO while offering faster training speed. The x-axis in the figure represents training epochs. Flow-GRPO-Fast with 2 training steps per iteration performs better than Flow-GRPO, while Flow-GRPO-Fast with only 1 training step per iteration performs slightly worse than Flow-GRPO. In both cases, compared to Flow-GRPO’s 10 training steps per iteration, the training process is significantly faster.
 
-We find that injecting noise at a randomly selected step among the first two steps yields the best results. Introducing large noise in low-noise regions tends to significantly degrade image quality, whereas injecting it in higher-noise regions promotes diversity with minimal impact on the final visual quality during data collection.
+<p align="center">
+  <img src="flow_grpo/assets/flow_grpo_fast.png" alt="Flow-GRPO-Fast Illustration" width=450"/>
+</p>
 
-Please use scripts in `scripts/multi_node/sd3_s1` to run these experiments.
+
+Please use scripts in `scripts/multi_node/sd3_fast` to run these experiments.
+
 ## 🤗 Model
 | Task    | Model |
 | -------- | -------- |
@@ -120,6 +145,15 @@ pip install git+https://github.com/openai/CLIP.git
 ```
 
 ### 4. Start Training
+If the GPU memory is insufficient, you can use DeepSpeed Zero2 or Zero3.
+
+```bash
+# zero2
+accelerate launch --config_file scripts/accelerate_configs/deepspeed_zero2.yaml
+# zero3
+accelerate launch --config_file scripts/accelerate_configs/deepspeed_zero3.yaml
+```
+
 #### GRPO
 Single-node training:
 ```bash
@@ -154,6 +188,7 @@ Please install `diffusers` from the main branch to support `FLUX.1-Kontext-dev`:
 ```bash
 pip install git+https://github.com/huggingface/diffusers.git
 ```
+After upgrading Diffusers, some packages such as PEFT may also need to be upgraded. If you encounter any errors, please upgrade them according to the error messages.
 Then, run the scripts:
 ```bash
 # Master node
@@ -233,11 +268,21 @@ Additionally, setting `config.train.gradient_accumulation_steps = config.sample.
 This repo is based on [ddpo-pytorch](https://github.com/kvablack/ddpo-pytorch) and [diffusers](https://github.com/huggingface/diffusers). We thank the authors for their valuable contributions to the AIGC community. Special thanks to Kevin Black for the excellent *ddpo-pytorch* repo.
 
 ## ⭐Citation
+If you find Flow-GRPO useful for your research or projects, we would greatly appreciate it if you could cite the following paper:
 ```
 @article{liu2025flow,
   title={Flow-grpo: Training flow matching models via online rl},
   author={Liu, Jie and Liu, Gongye and Liang, Jiajun and Li, Yangguang and Liu, Jiaheng and Wang, Xintao and Wan, Pengfei and Zhang, Di and Ouyang, Wanli},
   journal={arXiv preprint arXiv:2505.05470},
+  year={2025}
+}
+```
+If you find Flow-DPO useful for your research or projects, we would greatly appreciate it if you could cite the following paper:
+```
+@article{liu2025improving,
+  title={Improving video generation with human feedback},
+  author={Liu, Jie and Liu, Gongye and Liang, Jiajun and Yuan, Ziyang and Liu, Xiaokun and Zheng, Mingwu and Wu, Xiele and Wang, Qiulin and Qin, Wenyu and Xia, Menghan and others},
+  journal={arXiv preprint arXiv:2501.13918},
   year={2025}
 }
 ```

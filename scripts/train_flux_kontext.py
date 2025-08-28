@@ -13,6 +13,11 @@ from accelerate.utils import set_seed, ProjectConfiguration
 from accelerate.logging import get_logger
 from diffusers import FluxKontextPipeline
 from diffusers.utils.torch_utils import is_compiled_module
+from transformers.integrations.deepspeed import (
+    is_deepspeed_zero3_enabled,
+    set_hf_deepspeed_config,
+    unset_hf_deepspeed_config,
+)
 import numpy as np
 import flow_grpo.prompts
 import flow_grpo.rewards
@@ -462,10 +467,6 @@ def main(_):
         eps=config.train.adam_epsilon,
     )
 
-    # prepare prompt and reward fn
-    reward_fn = getattr(flow_grpo.rewards, 'multi_score')(accelerator.device, config.reward_fn)
-    eval_reward_fn = getattr(flow_grpo.rewards, 'multi_score')(accelerator.device, config.reward_fn)
-
     train_dataset = GenevalPromptImageDataset(config.dataset, 'train')
     test_dataset = GenevalPromptImageDataset(config.dataset, 'test')
 
@@ -504,10 +505,21 @@ def main(_):
     autocast = contextlib.nullcontext if config.use_lora else accelerator.autocast
     # autocast = accelerator.autocast
 
-    # Prepare everything with our `accelerator`.
     # for deepspeed zero
     if accelerator.state.deepspeed_plugin:
         accelerator.state.deepspeed_plugin.deepspeed_config['train_micro_batch_size_per_gpu'] = config.sample.train_batch_size
+    # prepare prompt and reward fn
+    if is_deepspeed_zero3_enabled():
+        # Using deepspeed zero3 will cause the model parameter `weight.shape` to be empty.
+        unset_hf_deepspeed_config()
+        reward_fn = getattr(flow_grpo.rewards, 'multi_score')(accelerator.device, config.reward_fn)
+        eval_reward_fn = getattr(flow_grpo.rewards, 'multi_score')(accelerator.device, config.reward_fn)
+        set_hf_deepspeed_config(accelerator.state.deepspeed_plugin.dschf)
+    else:
+        reward_fn = getattr(flow_grpo.rewards, 'multi_score')(accelerator.device, config.reward_fn)
+        eval_reward_fn = getattr(flow_grpo.rewards, 'multi_score')(accelerator.device, config.reward_fn)
+    
+    # Prepare everything with our `accelerator`.
     transformer, optimizer, train_dataloader, test_dataloader = accelerator.prepare(transformer, optimizer, train_dataloader, test_dataloader)
     # executor to perform callbacks asynchronously. this is beneficial for the llava callbacks which makes a request to a
     # remote server running llava inference.

@@ -188,7 +188,6 @@ def compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, co
             return_dict=False,
         )[0]
         noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-        noise_pred_uncond = noise_pred_uncond.detach()
         noise_pred = (
             noise_pred_uncond
             + config.sample.guidance_scale

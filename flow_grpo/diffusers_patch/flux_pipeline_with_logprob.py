@@ -159,7 +159,6 @@ def pipeline_with_logprob(
                 joint_attention_kwargs=self.joint_attention_kwargs,
                 return_dict=False,
             )[0]
-            noise_pred = noise_pred.to(prompt_embeds.dtype)
             latents_dtype = latents.dtype
             latents, log_prob, prev_latents_mean, std_dev_t = sde_step_with_logprob(
                 self.scheduler, 
