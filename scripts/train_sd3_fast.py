@@ -204,7 +204,7 @@ def compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, co
 
     return prev_sample, log_prob, prev_sample_mean, std_dev_t
 
-def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, reward_fn, executor, autocast, num_train_timesteps, ema, transformer_trainable_parameters):
+def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, reward_fn, autocast, num_train_timesteps, ema, transformer_trainable_parameters):
     if config.train.ema:
         ema.copy_ema_to(transformer_trainable_parameters, store_temp=True)
     neg_prompt_embed, neg_pooled_prompt_embed = compute_text_embeddings([""], text_encoders, tokenizers, max_sequence_length=128, device=accelerator.device)
@@ -250,10 +250,7 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
                     process_index=accelerator.process_index,
                     sample_num_steps=config.sample.num_steps,
                 )
-        rewards = executor.submit(reward_fn, images, prompts, prompt_metadata, only_strict=False)
-        # yield to to make sure reward computation starts
-        time.sleep(0)
-        rewards, reward_metadata = rewards.result()
+        rewards, reward_metadata = reward_fn(images, prompts, prompt_metadata, only_strict=False)
 
         for key, value in rewards.items():
             rewards_gather = accelerator.gather(torch.as_tensor(value, device=accelerator.device)).cpu().numpy()
@@ -552,10 +549,6 @@ def main(_):
     # Prepare everything with our `accelerator`.
     transformer, optimizer, train_dataloader, test_dataloader = accelerator.prepare(transformer, optimizer, train_dataloader, test_dataloader)
 
-    # executor to perform callbacks asynchronously. this is beneficial for the llava callbacks which makes a request to a
-    # remote server running llava inference.
-    executor = futures.ThreadPoolExecutor(max_workers=8)
-
     # Train!
     samples_per_epoch = (
         config.sample.train_batch_size
@@ -593,9 +586,9 @@ def main(_):
     for epoch in range(config.max_epochs):
         #################### EVAL ####################
         pipeline.transformer.eval()
-        if epoch % config.eval_freq == 0:
-            eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, eval_reward_fn, executor, autocast, num_train_timesteps, ema, transformer_trainable_parameters)
-        if epoch % config.save_freq == 0 and epoch > 0 and accelerator.is_main_process:
+        if config.eval_freq > 0 and epoch % config.eval_freq == 0:
+            eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, eval_reward_fn, autocast, num_train_timesteps, ema, transformer_trainable_parameters)
+        if config.eval_freq > 0 and epoch % config.save_freq == 0 and epoch > 0 and accelerator.is_main_process:
             save_ckpt(config.save_dir, transformer, global_step, accelerator, ema, transformer_trainable_parameters, config)
 
         #################### SAMPLING ####################
@@ -656,9 +649,7 @@ def main(_):
             prompts = pipeline.tokenizer.batch_decode(
                 prompt_ids.repeat(config.sample.mini_num_image_per_prompt,1), skip_special_tokens=True
             )
-            rewards = executor.submit(reward_fn, images, prompts, prompt_metadata, only_strict=True)
-            # yield to to make sure reward computation starts
-            time.sleep(0)
+
             samples.append(
                 {
                     "prompt_ids": prompt_ids.repeat(config.sample.mini_num_image_per_prompt,1),
@@ -672,7 +663,6 @@ def main(_):
                         :, 1:
                     ],  # each entry is the latent after timestep t
                     "log_probs": log_probs,
-                    "rewards": rewards,
                 }
             )
 
@@ -683,7 +673,7 @@ def main(_):
             disable=not accelerator.is_local_main_process,
             position=0,
         ):
-            rewards, reward_metadata = sample["rewards"].result()
+            rewards, reward_metadata = reward_fn(images, prompts, prompt_metadata, only_strict=True)
             # accelerator.print(reward_metadata)
             sample["rewards"] = {
                 key: torch.as_tensor(value, device=accelerator.device).float()
@@ -840,7 +830,7 @@ def main(_):
                             prev_sample, log_prob, prev_sample_mean, std_dev_t = compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, config)
                             if config.train.beta > 0:
                                 with torch.no_grad():
-                                    with transformer.module.disable_adapter():
+                                    with accelerator.unwrap_model(transformer).disable_adapter():
                                         _, _, prev_sample_mean_ref, _ = compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, config)
 
                         # grpo logic

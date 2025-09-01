@@ -31,24 +31,9 @@ def compressibility():
     return config
 
 def prompt_align():
-    config = base.get_config()
-    config.max_epochs = 500
-    config.eval_freq = 10
+    config = compressibility()
 
     config.run_name = "prompt-align"
-    config.compile = True
-
-    # model + sampling
-    config.pretrained.model = "stabilityai/stable-diffusion-3.5-medium"
-    config.sample.num_steps = 40
-    config.sample.eval_num_steps = 40
-    config.sample.guidance_scale = 4.5
-    config.resolution = 512
-
-    # batching (keep consistent with other optimize presets)
-    config.sample.num_batches_per_epoch = 1
-    config.sample.train_batch_size = 32
-    config.sample.test_batch_size = 32
 
     # dataset + prompting
     config.dataset = os.path.join(os.getcwd(), "dataset/prompt_align_1")

@@ -464,23 +464,28 @@ def gemini_score():
     ]
 
     question_template = inspect.cleandoc("""
-        Determine if the image accurately adheres to the prompt: "{prompt}"?
-        Rate it from 1 (least-accurate) to 5 (most-accurate).
-        Response in format: @answer=rating
+        Determine how accurately the image matches the text prompt: "{prompt}"
+        Rate from 1 to 5 based on the criteria below:
+        - 1 = Does not match at all
+        - 2 = Partial match, some elements correct, others missing/wrong
+        - 3 = Fair match, but several details off
+        - 4 = Good match, only minor details off
+        - 5 = Perfect match
+        Response in the format: @answer=rating
     """)
 
-    answer_pattern = re.compile(r"@answer=\(?(\d+)\)?")
+    answer_pattern = re.compile(r"@answer=(\d+)")
 
-    @retry(times=10, failed_return=None, exceptions=(ServerError, ValueError))
+    @retry(times=5, failed_return=0.0, exceptions=(ServerError, ValueError))
     def _score_single(image_array, prompt, retry_attempt):
         # image_array is HWC uint8
-        pil_img = Image.fromarray(image_array).convert("RGB").resize((128, 128))
+        pil_img = Image.fromarray(image_array).convert("RGB").resize((256, 256))
         buf = io.BytesIO()
         pil_img.save(buf, format="JPEG")
         image_part = types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg")
 
         gen_config = types.GenerateContentConfig(
-            temperature=0.0 if retry_attempt == 0 else 0.3,
+            temperature=0.0 if retry_attempt == 0 else 0.2 * retry_attempt,
             safety_settings=safety_settings,
             thinking_config=types.ThinkingConfig(thinking_budget=512, include_thoughts=False),
         )
