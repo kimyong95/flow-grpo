@@ -31,8 +31,8 @@ def pipeline_with_logprob(
     output_type: Optional[str] = "pil",
     joint_attention_kwargs: Optional[Dict[str, Any]] = None,
     clip_skip: Optional[int] = None,
+    callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
     callback_on_step_end_tensor_inputs: List[str] = ["latents"],
-    step_function_callback: Optional[Callable] = None,
     max_sequence_length: int = 256,
     skip_layer_guidance_scale: float = 2.8,
     noise_level: float = 0.7,
@@ -161,9 +161,7 @@ def pipeline_with_logprob(
                 
             latents_dtype = latents.dtype
 
-            step_function = step_function_callback if step_function_callback is not None else sde_step_with_logprob
-
-            latents, log_prob, prev_latents_mean, std_dev_t, pred_sample = step_function(
+            latents, log_prob, prev_latents_mean, std_dev_t, pred_sample = sde_step_with_logprob(
                 self.scheduler, 
                 noise_pred.float(), 
                 t.unsqueeze(0), 
@@ -172,18 +170,28 @@ def pipeline_with_logprob(
                 noise=noise[i] if noise is not None else None,
             )
 
-            all_latents.append(latents)
-            all_log_probs.append(log_prob)
-            all_pred_samples.append(pred_sample)
             if latents.dtype != latents_dtype:
                 latents = latents.to(latents_dtype)
             
-
-
             # call the callback, if provided
+            if callback_on_step_end is not None:
+                callback_kwargs = {}
+                for k in callback_on_step_end_tensor_inputs:
+                    callback_kwargs[k] = locals()[k]
+                callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+
+                latents = callback_outputs.pop("latents", latents)
+                prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+                pooled_prompt_embeds = callback_outputs.pop("pooled_prompt_embeds", pooled_prompt_embeds)
+
             if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                 progress_bar.update()
-        
+
+            all_latents.append(latents)
+            all_log_probs.append(log_prob)
+            all_pred_samples.append(pred_sample)
+
+
         all_pred_samples.append(latents)
 
     latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
