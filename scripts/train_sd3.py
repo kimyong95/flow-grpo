@@ -811,6 +811,9 @@ def main(_):
         samples = {k: v[mask] for k, v in samples.items()}
 
         total_batch_size, num_timesteps = samples["timesteps"].shape
+        if total_batch_size == 0:
+            continue
+        
         # assert (
         #     total_batch_size
         #     == config.sample.train_batch_size * config.sample.num_batches_per_epoch

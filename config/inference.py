@@ -15,10 +15,18 @@ def compressibility():
     config.sample.guidance_scale = 4.5
     config.resolution = 512
 
-    config.sample.mini_batch_size = 16     # Not in paper
-    config.sample.init_batch_size = 64     # b_0 in the paper
-    config.sample.final_batch_size = 32    # b_1 in the paper
-    config.sample.evaluation_budget = 64   # C in the paper
+    # D-Search
+    # config.sample.init_batch_size = 64     # b_0 in the paper
+    # config.sample.final_batch_size = 32    # b_1 in the paper
+    # config.sample.evaluation_budget = 256   # C in the paper
+    # config.sample.selection_mode = "d-search"
+
+    # Tree-G
+    config.sample.init_batch_size = 32
+    config.sample.final_batch_size = 32
+    config.sample.evaluation_budget = 256
+    config.sample.selection_mode = "tree-g"
+
 
     config.dataset = os.path.join(os.getcwd(), "dataset/pickscore")
 

@@ -1,10 +1,16 @@
 import re
 import inspect
 import time
+import io
+import functools
+import concurrent.futures as futures
 from PIL import Image
 import torch
 from transformers import AutoProcessor, Gemma3nForConditionalGeneration
 from typing import List
+from google import genai
+from google.genai import types
+from google.genai.errors import ServerError
 
 class GemmaScorer:
 
@@ -12,6 +18,7 @@ class GemmaScorer:
         self.system_prompt = (
             "You are a helpful assistant with advanced reasoning ability. "
             "Always analyze the task carefully step by step before giving your final response. "
+            "Use natural language, do not use tool/function calling. "
             "Enclose your internal reasoning within <think> ... </think> tags. "
         )
         self.question_template = inspect.cleandoc("""
@@ -57,27 +64,35 @@ class GemmaScorer:
         batch_messages: List[List[dict]],
         max_input_len: int = 2048,
         temperature: float = 0.0,
+        batch_size: int = 8,
     ) -> List[str]:
-        inputs = self.processor.apply_chat_template(
-            batch_messages,
-            add_generation_prompt=True,
-            tokenize=True,
-            return_dict=True,
-            return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=max_input_len
-        ).to(self.model.device)
 
-        with torch.inference_mode():
-            output = self.model.generate(
-                **inputs,
-                max_new_tokens=int(max_input_len//2),
-                do_sample=not temperature > 0.0,
-                temperature=temperature if temperature > 0.0 else None,
-            )
-        replies = self.processor.tokenizer.batch_decode(output[:,max_input_len:], skip_special_tokens=True)
-        return replies
+        all_replies: List[str] = []
+        for start_idx in range(0, len(batch_messages), batch_size):
+            mini_batch = batch_messages[start_idx:start_idx + batch_size]
+
+            inputs = self.processor.apply_chat_template(
+                mini_batch,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+                padding="max_length",
+                truncation=True,
+                max_length=max_input_len
+            ).to(self.model.device)
+
+            with torch.inference_mode():
+                output = self.model.generate(
+                    **inputs,
+                    max_new_tokens=int(max_input_len//2),
+                    do_sample=not temperature > 0.0,
+                    temperature=temperature if temperature > 0.0 else None,
+                )
+            replies = self.processor.tokenizer.batch_decode(output[:, max_input_len:], skip_special_tokens=True)
+            all_replies.extend(replies)
+
+        return all_replies
 
 
     def __call__(self, pil_images, prompts, metadata):
@@ -127,4 +142,91 @@ class GemmaScorer:
         response_texts = [[desc_replies[i], rating_replies[i]] for i in range(N)]
 
         return scores, {"response_texts": response_texts}
+
+
+def retry(times, failed_return, exceptions, backoff_factor=1):
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            attempt = 0
+            while attempt < times:
+                try:
+                    return func(*args, **kwargs, retry_attempt=attempt)
+                except exceptions as e:
+                    print(
+                        f"Exception [{type(e)}:{e}] thrown when attempting to run {func}, attempt {attempt} of {times}"
+                    )
+                    time.sleep(backoff_factor * 2**attempt)
+                    attempt += 1
+            return failed_return
+        return wrapper
+    return decorator
+
+
+class GeminiScorer:
+
+    def __init__(self):
+
+        self.safety_settings = [
+            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+        ]
+
+        self.question_template = inspect.cleandoc("""
+            Determine how accurately the image matches the text prompt: "{prompt}"
+            Rate from 1 to 5 based on the criteria below:
+            - 1 = Does not match at all
+            - 2 = Partial match, some elements correct, others missing/wrong
+            - 3 = Fair match, but several details off
+            - 4 = Good match, only minor details off
+            - 5 = Perfect match
+            Response in the format: @answer=rating
+        """)
+
+        self.answer_pattern = re.compile(r"@answer=(\d+)")
+
+    @retry(times=5, failed_return=0.0, exceptions=(ServerError, ValueError))
+    def _score_single(self, pil_img, prompt, retry_attempt):
+        client = genai.Client()
+        img = pil_img.convert("RGB").resize((256, 256))
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG")
+        image_part = types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg")
+
+        gen_config = types.GenerateContentConfig(
+            temperature=0.0 if retry_attempt == 0 else 0.2 * retry_attempt,
+            safety_settings=self.safety_settings,
+            thinking_config=types.ThinkingConfig(thinking_budget=512, include_thoughts=False),
+        )
+
+        question = self.question_template.format(prompt=prompt)
+
+        response = client.models.generate_content(
+            model="gemini-2.5-flash-lite",
+            contents=[image_part, question],
+            config=gen_config,
+        )
+        match = self.answer_pattern.search(response.text)
+        if match:
+            return float(match.group(1))
+        else:
+            raise ValueError(f"Gemini response did not match expected pattern: {response.text}")
+
+    def __call__(self, pil_images, prompts, metadata):
+        N = len(prompts)
+        scores = [0.0] * N
+        if N == 0:
+            return scores, {}
+        with futures.ThreadPoolExecutor(max_workers=8) as ex:
+            fut_to_idx = {
+                ex.submit(self._score_single, img, prompt): i
+                for i, (img, prompt) in enumerate(zip(pil_images, prompts))
+            }
+            for fut in futures.as_completed(fut_to_idx):
+                i = fut_to_idx[fut]
+                scores[i] = fut.result()
+        return scores, {}
 

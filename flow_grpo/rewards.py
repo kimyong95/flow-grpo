@@ -446,62 +446,9 @@ def gemini_score():
     - A fixed question is used for all images.
     - Returns a numeric score per image (0 or 1) parsed from model output pattern @answer=<0|1>.
     """
-    import io
-    import re
-    import inspect
-    from PIL import Image
-    from google import genai
-    from google.genai import types
+    from flow_grpo.prompt_align_scorer import GeminiScorer
 
-    client = genai.Client()
-
-    safety_settings = [
-        types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
-        types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=types.HarmBlockThreshold.BLOCK_NONE),
-        types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
-        types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
-        types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY, threshold=types.HarmBlockThreshold.BLOCK_NONE),
-    ]
-
-    question_template = inspect.cleandoc("""
-        Determine how accurately the image matches the text prompt: "{prompt}"
-        Rate from 1 to 5 based on the criteria below:
-        - 1 = Does not match at all
-        - 2 = Partial match, some elements correct, others missing/wrong
-        - 3 = Fair match, but several details off
-        - 4 = Good match, only minor details off
-        - 5 = Perfect match
-        Response in the format: @answer=rating
-    """)
-
-    answer_pattern = re.compile(r"@answer=(\d+)")
-
-    @retry(times=5, failed_return=0.0, exceptions=(ServerError, ValueError))
-    def _score_single(image_array, prompt, retry_attempt):
-        # image_array is HWC uint8
-        pil_img = Image.fromarray(image_array).convert("RGB").resize((256, 256))
-        buf = io.BytesIO()
-        pil_img.save(buf, format="JPEG")
-        image_part = types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg")
-
-        gen_config = types.GenerateContentConfig(
-            temperature=0.0 if retry_attempt == 0 else 0.2 * retry_attempt,
-            safety_settings=safety_settings,
-            thinking_config=types.ThinkingConfig(thinking_budget=512, include_thoughts=False),
-        )
-        
-        question = question_template.format(prompt=prompt)
-
-        response = client.models.generate_content(
-            model="gemini-2.5-flash-lite",
-            contents=[image_part, question],
-            config=gen_config,
-        )
-        match = answer_pattern.search(response.text)
-        if match:
-            return float(match.group(1))
-        else:
-            raise ValueError(f"Gemini response did not match expected pattern: {response.text}")
+    scorer = GeminiScorer()
 
     def _fn(images, prompts, metadata):  # metadata ignored
         if isinstance(images, torch.Tensor):
@@ -511,8 +458,9 @@ def gemini_score():
         else:
             # assume numpy batch HWC already
             np_imgs = images
-        scores = [ _score_single(img, prompt) for img, prompt in zip(np_imgs, prompts) ]
-        return scores, {}
+        pil_imgs = [Image.fromarray(img).convert("RGB") for img in np_imgs]
+        scores, meta = scorer(pil_imgs, prompts, metadata)
+        return scores, meta
 
     return _fn
 
@@ -529,7 +477,8 @@ def gemma_score(device):
         
         pil_imgs = [Image.fromarray(img).convert("RGB") for img in np_imgs]
 
-        return scorer(pil_imgs, prompts, metadata)
+        scores, meta = scorer(pil_imgs, prompts, metadata)
+        return scores, meta
     return _fn
 
 
@@ -541,7 +490,7 @@ def multi_score(device, score_dict):
         "imagereward": imagereward_score,
         "pickscore": pickscore_score,
         "qwenvl": qwenvl_score,
-        "aesthetic": aesthetic_score,
+        "s": aesthetic_score,
         "jpeg_compressibility": jpeg_compressibility,
         "unifiedreward": unifiedreward_score_sglang,
         "geneval": geneval_score,

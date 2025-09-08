@@ -313,7 +313,7 @@ def main(_):
     if accelerator.is_main_process:
         wandb.init(
             project="flow_grpo",
-            name=f"inference-{config.run_name}",
+            name=f"inference-{config.sample.selection_mode}-{config.run_name}",
             config=config.to_dict(),
         )
     logger.info(f"\n{config}")
@@ -511,9 +511,6 @@ def main(_):
 
     def callback_fn(self, index, timestep, kwargs):
 
-        if index == self.scheduler.num_inference_steps - 1:
-            return {}
-
         timesteps = kwargs["timesteps"]
         prev_latents_mean = kwargs["prev_latents_mean"]
         std_dev_t = kwargs["std_dev_t"]
@@ -542,16 +539,13 @@ def main(_):
             '(two) ... -> (two m) ...', two=2, m = expansion_size,
         )
         
-        prev_sample = []
-        prev_sample_rewards = []
-        images = []
+        prev_sample_candidates = []
+        prev_sample_candidates_rewards = []
+        images_candinates = []
         for i, prev_latents_mean_i in enumerate(prev_latents_mean):
-
-            noise_i = randn_tensor(
-                (expansion_size,) + tuple(prev_latents_mean_i.shape),
-                dtype=prev_latents_mean_i.dtype,
-                device=prev_latents_mean_i.device,
-            )
+            
+            # sample
+            noise_i = randn_tensor((expansion_size,) + tuple(prev_latents_mean_i.shape), dtype=prev_latents_mean_i.dtype, device=prev_latents_mean_i.device)
             prev_sample_i = prev_latents_mean_i + std_dev_t * torch.sqrt(-1*dt) * noise_i
             pred_sample_i = sample_one_step(
                 self,
@@ -560,28 +554,48 @@ def main(_):
                 prompt_embeds=prompt_embeds_expand,
                 pooled_prompt_embeds=pooled_prompt_embeds_expand,
             )
+            prev_sample_candidates.append(prev_sample_i.to(self.transformer.dtype))
+            
+            # evaluate
             images_i = latents_to_images(self, pred_sample_i, output_type="pt")
-            _prompts = [prompts[0]] * expansion_size
-            _prompts_metadata = [prompt_metadata[0]] * expansion_size
-            rewards_i, rewards_meta_i = reward_fn(images_i, _prompts, _prompts_metadata)
-            best_i = torch.argmax(torch.tensor(rewards_i["avg"])).item()
-            prev_sample.append(prev_sample_i[best_i])
-            prev_sample_rewards.append({key: value[best_i] for key, value in rewards_i.items()})
-            images.append(images_i[best_i])
+            images_candinates.append(images_i)
+            rewards_i, rewards_meta_i = reward_fn(images_i, [prompts[0]] * expansion_size, [prompt_metadata[0]] * expansion_size)
+            prev_sample_candidates_rewards.append(torch.tensor(rewards_i["avg"]))
 
-        # aggregate
-        prev_sample = torch.stack(prev_sample)
-        prev_sample_rewards = {k: torch.tensor([dic[k] for dic in prev_sample_rewards]) for k in prev_sample_rewards[0]}
-        
-        # filter
-        next_batch_size = batch_size_t[prev_step_index]
-        next_indices = prev_sample_rewards["avg"].topk(next_batch_size).indices
-        prev_sample_rewards = {k: v[next_indices] for k, v in prev_sample_rewards.items()}
-        prev_sample = prev_sample[next_indices]
-        prev_sample = prev_sample.to(self.transformer.dtype)
-        images = [images[idx] for idx in next_indices]
+        # selection
+        next_batch_size = batch_size_t[index+1]
+
+        if config.sample.selection_mode == "d-search":
+            prev_sample_candidates = torch.stack(prev_sample_candidates)
+            prev_sample_candidates_rewards = torch.stack(prev_sample_candidates_rewards)
+
+            # instance-wise best
+            best_indices = prev_sample_candidates_rewards.argmax(dim=1)
+            prev_sample_rewards = prev_sample_candidates_rewards[torch.arange(len(best_indices)), best_indices]
+            prev_sample = prev_sample_candidates[torch.arange(len(prev_sample_candidates)), best_indices]
+            images = [images_candinates[i][best_indices[i]] for i in range(len(best_indices))]
+
+            # global selection
+            next_indices = prev_sample_rewards.topk(next_batch_size).indices
+            prev_sample_rewards = prev_sample_rewards[next_indices]
+            prev_sample = prev_sample[next_indices]
+            images = [images[idx] for idx in next_indices]
+
+        elif config.sample.selection_mode == "tree-g":
+            # flatten
+            prev_sample_candidates = torch.cat(prev_sample_candidates, dim=0)
+            prev_sample_candidates_rewards = torch.cat(prev_sample_candidates_rewards, dim=0)
+            images_candinates = [img for imgs in images_candinates for img in imgs]
+
+            # global selection
+            next_indices = prev_sample_candidates_rewards.topk(next_batch_size).indices
+            prev_sample_rewards = prev_sample_candidates_rewards[next_indices]
+            prev_sample = prev_sample_candidates[next_indices]
+            images = [images_candinates[idx] for idx in next_indices]
+
         prompt_embeds = einops.repeat(prompt_embeds_base, '(two) ... -> (two b) ...', two=2, b = next_batch_size)
         pooled_prompt_embeds = einops.repeat(pooled_prompt_embeds_base, '(two) ... -> (two b) ...', two=2, b = next_batch_size)
+        
 
         with tempfile.TemporaryDirectory() as tmpdir:
             for i in range(len(images)):
@@ -599,10 +613,11 @@ def main(_):
                             os.path.join(tmpdir, f"{idx}.jpg"),
                             caption=f"{prompts[0]} | avg: {avg_reward:.2f}",
                         )
-                        for idx, avg_reward in enumerate(prev_sample_rewards["avg"])
+                        for idx, avg_reward in enumerate(prev_sample_rewards)
                     ],
                     "objective_evaluations": objective_evaluations[index],
-                    **{f"reward_{key}": value.mean() for key, value in prev_sample_rewards.items()},
+                    f"reward_{config.reward_fn.keys()[0]}": prev_sample_rewards.mean(),
+                    f"reward_avg": prev_sample_rewards.mean(),
                 },
                 step=index,
             )
