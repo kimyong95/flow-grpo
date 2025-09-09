@@ -66,7 +66,6 @@ class GemmaScorer:
         temperature: float = 0.0,
         batch_size: int = 8,
     ) -> List[str]:
-
         all_replies: List[str] = []
         for start_idx in range(0, len(batch_messages), batch_size):
             mini_batch = batch_messages[start_idx:start_idx + batch_size]
@@ -96,7 +95,6 @@ class GemmaScorer:
 
 
     def __call__(self, pil_images, prompts, metadata):
-        
         N = len(prompts)
         messages: List[List[dict]] = []
         for pil_img in pil_images:
@@ -138,6 +136,11 @@ class GemmaScorer:
             
             failed_indices = next_failed_indices
             try_atempts += 1
+            
+            if try_atempts > 5: # safety break
+                print("Exceeded max retry attempts.")
+                break
+
 
         response_texts = [[desc_replies[i], rating_replies[i]] for i in range(N)]
 
@@ -145,12 +148,14 @@ class GemmaScorer:
 
 
 def retry(times, failed_return, exceptions, backoff_factor=1):
+    """A decorator for retrying a function upon specific exceptions."""
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
             attempt = 0
             while attempt < times:
                 try:
+                    # Pass the current attempt number to the decorated function
                     return func(*args, **kwargs, retry_attempt=attempt)
                 except exceptions as e:
                     print(
@@ -175,51 +180,67 @@ class GeminiScorer:
             types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY, threshold=types.HarmBlockThreshold.BLOCK_NONE),
         ]
 
+        self.description_prompt = "Provide a detailed description of this image."
         self.question_template = inspect.cleandoc("""
-            Determine how accurately the image matches the text prompt: "{prompt}"
-            Rate from 1 to 5 based on the criteria below:
+            Based on your description, determine how accurately the image adheres to the text prompt: "{prompt}"
+            Assign a rating from 1 to 5 based on the criteria below:
             - 1 = Does not match at all
             - 2 = Partial match, some elements correct, others missing/wrong
             - 3 = Fair match, but several details off
             - 4 = Good match, only minor details off
             - 5 = Perfect match
-            Response in the format: @answer=rating
+            Provide your final rating in the format: @answer=rating
         """)
 
         self.answer_pattern = re.compile(r"@answer=(\d+)")
 
-    @retry(times=5, failed_return=0.0, exceptions=(ServerError, ValueError))
+    @retry(times=5, failed_return=(0.0, "Error", "Error"), exceptions=(ServerError, ValueError))
     def _score_single(self, pil_img, prompt, retry_attempt):
+        """Performs the two-pass scoring for a single image."""
         client = genai.Client()
+        chat = client.chats.create(model="gemini-2.5-flash-lite") 
         img = pil_img.convert("RGB").resize((256, 256))
         buf = io.BytesIO()
         img.save(buf, format="JPEG")
         image_part = types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg")
 
-        gen_config = types.GenerateContentConfig(
+        # --- Pass 1: Get Description ---
+        desc_gen_config = types.GenerateContentConfig(
+            temperature=0.0,  # Factual description
+            safety_settings=self.safety_settings,
+            thinking_config=types.ThinkingConfig(thinking_budget=0), # Disables thinking
+        )
+        desc_response = chat.send_message([image_part,self.description_prompt], config=desc_gen_config)
+        description = desc_response.text
+        if not description:
+            raise ValueError("Gemini failed to generate a description.")
+
+        # --- Pass 2: Get Score based on description ---
+        score_gen_config = types.GenerateContentConfig(
             temperature=0.0 if retry_attempt == 0 else 0.2 * retry_attempt,
             safety_settings=self.safety_settings,
             thinking_config=types.ThinkingConfig(thinking_budget=512, include_thoughts=False),
         )
-
         question = self.question_template.format(prompt=prompt)
-
-        response = client.models.generate_content(
-            model="gemini-2.5-flash-lite",
-            contents=[image_part, question],
-            config=gen_config,
-        )
-        match = self.answer_pattern.search(response.text)
+        score_response = chat.send_message(question, config=score_gen_config)
+        
+        match = self.answer_pattern.search(score_response.text)
         if match:
-            return float(match.group(1))
+            score = float(match.group(1))
+            return score, description, score_response.text
         else:
-            raise ValueError(f"Gemini response did not match expected pattern: {response.text}")
+            raise ValueError(f"Gemini response did not match expected pattern: {score_response.text}")
 
     def __call__(self, pil_images, prompts, metadata):
+        """Scores a batch of images against prompts in parallel."""
         N = len(prompts)
         scores = [0.0] * N
+        descriptions = [""] * N
+        rating_replies = [""] * N
+
         if N == 0:
             return scores, {}
+            
         with futures.ThreadPoolExecutor(max_workers=8) as ex:
             fut_to_idx = {
                 ex.submit(self._score_single, img, prompt): i
@@ -227,6 +248,10 @@ class GeminiScorer:
             }
             for fut in futures.as_completed(fut_to_idx):
                 i = fut_to_idx[fut]
-                scores[i] = fut.result()
-        return scores, {}
+                score, description, rating_reply = fut.result()
+                scores[i] = score
+                descriptions[i] = description
+                rating_replies[i] = rating_reply
 
+        response_texts = [[descriptions[i], rating_replies[i]] for i in range(N)]
+        return scores, {"response_texts": response_texts}

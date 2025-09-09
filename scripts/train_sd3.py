@@ -31,6 +31,21 @@ import random
 from torch.utils.data import Dataset, DataLoader, Sampler
 from flow_grpo.ema import EMAModuleWrapper
 
+from transformers.integrations.deepspeed import (
+    is_deepspeed_zero3_enabled,
+    set_hf_deepspeed_config,
+    unset_hf_deepspeed_config,
+)
+
+@contextlib.contextmanager
+def temporarily_disable_deepspeed(accelerator):
+    if is_deepspeed_zero3_enabled():
+        unset_hf_deepspeed_config()
+        yield
+        set_hf_deepspeed_config(accelerator.state.deepspeed_plugin.dschf)
+    else:
+        yield
+
 tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
 
 
@@ -470,8 +485,8 @@ def main(_):
     )
 
     # prepare prompt and reward fn
-    reward_fn = getattr(flow_grpo.rewards, 'multi_score')(accelerator.device, config.reward_fn)
-    eval_reward_fn = getattr(flow_grpo.rewards, 'multi_score')(accelerator.device, config.reward_fn)
+    with temporarily_disable_deepspeed(accelerator):
+        reward_fn = getattr(flow_grpo.rewards, 'multi_score')(accelerator.device, config.reward_fn)
 
     if config.prompt_fn == "general_ocr":
         train_dataset = TextPromptDataset(config.dataset, 'train')
@@ -554,6 +569,10 @@ def main(_):
     autocast = contextlib.nullcontext if config.use_lora else accelerator.autocast
     # autocast = accelerator.autocast
 
+    # for deepspeed zero
+    if accelerator.state.deepspeed_plugin:
+        accelerator.state.deepspeed_plugin.deepspeed_config['train_micro_batch_size_per_gpu'] = config.sample.train_batch_size
+
     # Prepare everything with our `accelerator`.
     transformer, optimizer, train_dataloader, test_dataloader = accelerator.prepare(transformer, optimizer, train_dataloader, test_dataloader)
 
@@ -595,7 +614,7 @@ def main(_):
         #################### EVAL ####################
         pipeline.transformer.eval()
         if config.eval_freq > 0 and epoch % config.eval_freq == 0:
-            eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, eval_reward_fn, autocast, num_train_timesteps, ema, transformer_trainable_parameters)
+            eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, reward_fn, autocast, num_train_timesteps, ema, transformer_trainable_parameters)
         if epoch % config.save_freq == 0 and epoch > 0 and accelerator.is_main_process:
             save_ckpt(config.save_dir, transformer, global_step, accelerator, ema, transformer_trainable_parameters, config)
 

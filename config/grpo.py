@@ -322,6 +322,7 @@ def general_ocr_sd3_4gpu():
 def pickscore_sd3_4gpu():
     gpu_number=4
     config = compressibility()
+    config.run_name = "pickscore"
     config.dataset = os.path.join(os.getcwd(), "dataset/pickscore")
 
     # sd3.5 medium
@@ -357,9 +358,22 @@ def pickscore_sd3_4gpu():
     config.per_prompt_stat_tracking = True
     return config
 
+
+def prompt_alignment_sd3_1gpu():
+    gpu_number=1
+    config = general_ocr_sd3_1gpu()
+
+    config.run_name = "prompt-alignment"
+    config.reward_fn = {
+        "gemma": 1.0,
+    }
+    config.dataset = os.path.join(os.getcwd(), "dataset/prompt_align_1")
+    return config
+
 def general_ocr_sd3_1gpu():
     gpu_number = 1
     config = compressibility()
+    config.run_name = "ocr"
     config.dataset = os.path.join(os.getcwd(), "dataset/ocr")
 
     # sd3.5 medium
@@ -396,6 +410,7 @@ def general_ocr_sd3_1gpu():
 
     config.per_prompt_stat_tracking = True
     return config
+
 
 def pickscore_flux():
     gpu_number=32

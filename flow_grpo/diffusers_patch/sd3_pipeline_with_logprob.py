@@ -114,7 +114,7 @@ def pipeline_with_logprob(
         device,
         generator,
         latents,
-    ).float()
+    ).to(self.transformer.dtype)
 
     # 5. Prepare timesteps
     scheduler_kwargs = {}
@@ -165,11 +165,10 @@ def pipeline_with_logprob(
                 latents.float(),
                 noise_level=noise_level,
             )
-            
+            latents = latents.to(latents_dtype)
             all_latents.append(latents)
             all_log_probs.append(log_prob)
-            # if latents.dtype != latents_dtype:
-            #     latents = latents.to(latents_dtype)
+            
             
             # call the callback, if provided
             if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
