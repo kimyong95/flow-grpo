@@ -1,0 +1,3 @@
+[submodule "tripo_sg"]
+	path = tripo_sg
+	url = https://github.com/kimyong95/TripoSG.git
