@@ -441,8 +441,8 @@ def main(_):
             "attn.to_v",
         ]
         transformer_lora_config = LoraConfig(
-            r=32,
-            lora_alpha=64,
+            r=config.train.lora_rank,
+            lora_alpha=config.train.lora_alpha,
             init_lora_weights="gaussian",
             target_modules=target_modules,
         )
@@ -677,6 +677,12 @@ def main(_):
                 config.sample.train_batch_size, 1
             )  # (batch_size, num_steps)
 
+            rewards, reward_metadata = reward_fn(images, prompts, prompt_metadata, only_strict=True)
+            rewards = {
+                key: torch.as_tensor(value, device=accelerator.device).float()
+                for key, value in rewards.items()
+            }
+
             samples.append(
                 {
                     "prompt_ids": prompt_ids,
@@ -690,22 +696,9 @@ def main(_):
                         :, 1:
                     ],  # each entry is the latent after timestep t
                     "log_probs": log_probs,
+                    "rewards": rewards,
                 }
             )
-
-        # wait for all rewards to be computed
-        for sample in tqdm(
-            samples,
-            desc="Waiting for rewards",
-            disable=not accelerator.is_local_main_process,
-            position=0,
-        ):
-            rewards, reward_metadata = reward_fn(images, prompts, prompt_metadata, only_strict=True)
-            # accelerator.print(reward_metadata)
-            sample["rewards"] = {
-                key: torch.as_tensor(value, device=accelerator.device).float()
-                for key, value in rewards.items()
-            }
 
         # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)
         samples = {
