@@ -16,6 +16,7 @@ def sde_step_with_logprob(
     noise_level: float = 0.7,
     prev_sample: Optional[torch.FloatTensor] = None,
     generator: Optional[torch.Generator] = None,
+    noise: Optional[torch.FloatTensor] = None,
 ):
     """
     Predict the sample from the previous timestep by reversing the SDE. This function propagates the flow
@@ -55,7 +56,7 @@ def sde_step_with_logprob(
             generator=generator,
             device=model_output.device,
             dtype=model_output.dtype,
-        )
+        )if noise is None else noise
         prev_sample = prev_sample_mean + std_dev_t * torch.sqrt(-1*dt) * variance_noise
 
     log_prob = (

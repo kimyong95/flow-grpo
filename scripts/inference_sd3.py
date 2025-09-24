@@ -498,6 +498,8 @@ def main(_):
     ]
     objective_evaluations = torch.tensor(objective_evaluations).cumsum(dim=0)
 
+    batch_size_t.append(config.sample.final_batch_size)
+    
     train_sampler.set_epoch(0)
     prompts_idx, prompts, prompt_metadata = next(train_iter)
 
@@ -524,7 +526,6 @@ def main(_):
         sigma_prev = pipeline.scheduler.sigmas[prev_step_index].view(-1, *([1] * (len(prev_latents_mean.shape) - 1)))
         sigma_max = pipeline.scheduler.sigmas[1].item()
         dt = sigma_prev - sigma
-        prev_timestep = timesteps[prev_step_index]
 
         batch_size = batch_size_t[index]
         expansion_size = expansion_size_t[index]
@@ -550,10 +551,10 @@ def main(_):
             pred_sample_i = sample_one_step(
                 self,
                 latents=prev_sample_i,
-                t=prev_timestep,
+                t=timesteps[prev_step_index],
                 prompt_embeds=prompt_embeds_expand,
                 pooled_prompt_embeds=pooled_prompt_embeds_expand,
-            )
+            ) if prev_step_index < len(timesteps) else prev_sample_i
             prev_sample_candidates.append(prev_sample_i.to(self.transformer.dtype))
             
             # evaluate
@@ -666,7 +667,7 @@ def main(_):
     with tempfile.TemporaryDirectory() as tmpdir:
         wandb.log(
             {
-                "images": [
+                "eval_images": [
                     wandb.Image(
                         image,
                         caption=f"{prompts[0]} | avg: {avg_reward:.2f}",
@@ -674,7 +675,7 @@ def main(_):
                     for image, avg_reward in zip(pil_images, rewards["avg"])
                 ],
                 "objective_evaluations": objective_evaluations[-1],
-                **{f"reward_{key}": torch.tensor(value).mean() for key, value in rewards.items()},
+                **{f"eval_reward_{key}": torch.tensor(value).mean() for key, value in rewards.items()},
             },
             step=global_step,
         )

@@ -11,6 +11,7 @@ from typing import List
 from google import genai
 from google.genai import types
 from google.genai.errors import ServerError
+import httpcore
 
 class GemmaScorer:
 
@@ -194,7 +195,7 @@ class GeminiScorer:
 
         self.answer_pattern = re.compile(r"@answer=(\d+)")
 
-    @retry(times=5, failed_return=(0.0, "Error", "Error"), exceptions=(ServerError, ValueError))
+    @retry(times=5, failed_return=(0.0, "Error", "Error"), exceptions=(ServerError, ValueError, httpcore.ProtocolError))
     def _score_single(self, pil_img, prompt, retry_attempt):
         """Performs the two-pass scoring for a single image."""
         client = genai.Client()
@@ -209,6 +210,7 @@ class GeminiScorer:
             temperature=0.0,  # Factual description
             safety_settings=self.safety_settings,
             thinking_config=types.ThinkingConfig(thinking_budget=0), # Disables thinking
+            max_output_tokens=1024,
         )
         desc_response = chat.send_message([image_part,self.description_prompt], config=desc_gen_config)
         description = desc_response.text
@@ -219,7 +221,8 @@ class GeminiScorer:
         score_gen_config = types.GenerateContentConfig(
             temperature=0.0 if retry_attempt == 0 else 0.2 * retry_attempt,
             safety_settings=self.safety_settings,
-            thinking_config=types.ThinkingConfig(thinking_budget=512, include_thoughts=False),
+            thinking_config=types.ThinkingConfig(thinking_budget=512, include_thoughts=True),
+            max_output_tokens=1024,
         )
         question = self.question_template.format(prompt=prompt)
         score_response = chat.send_message(question, config=score_gen_config)

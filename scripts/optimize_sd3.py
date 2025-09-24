@@ -222,8 +222,8 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
             sample_neg_prompt_embeds = sample_neg_prompt_embeds[:len(prompt_embeds)]
             sample_neg_pooled_prompt_embeds = sample_neg_pooled_prompt_embeds[:len(prompt_embeds)]
 
-        latents = torch.load("dataset/eval_latents/tensor.pt")[prompts_idx]
-        _, noise_projected = get_noise(mu, sigma, config.sample.test_batch_size, accelerator.device)
+        eval_noise = torch.load("dataset/eval_noise/tensor.pt", accelerator.device)[:,prompts_idx,:]
+        _, noise_projected = get_noise(mu, sigma, config.sample.test_batch_size, accelerator.device, base_noise=eval_noise[1:])
 
         with autocast():
             with torch.inference_mode():
@@ -240,7 +240,7 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
                     width=config.resolution, 
                     noise_level=config.sample.noise_level,
                     noise=unflatten(noise_projected),
-                    latents=latents,
+                    latents=eval_noise[0],
                 )
                 images = images.to(accelerator.device, dtype=torch.float32)
         
@@ -359,13 +359,18 @@ def update_parameters(mu, sigma, noise, objective_values):
     return mu, sigma
 
 
-def get_noise(mu, sigma, batch_size, device, generator=None):
+def get_noise(mu, sigma, batch_size, device, base_noise=None):
     batch_mu = einops.repeat(mu, 'T D -> T B D', B=batch_size)
 
     batch_sigma = einops.repeat(sigma, 'T D -> T B D', B=batch_size)
 
-    batch_noise_original = torch.randn(batch_mu.size(), device=device, generator=generator)
-
+    if base_noise is not None:
+        base_noise = einops.repeat(base_noise, 'T B ... -> T B (...)')
+        assert base_noise.shape == batch_mu.shape
+        batch_noise_original = base_noise
+    else:
+        batch_noise_original = torch.randn(batch_mu.size(), device=device)
+    
     batch_noise = batch_mu + batch_sigma**0.5 * batch_noise_original
 
     batch_noise_original_norm = batch_noise_original.norm(dim=-1)
@@ -588,12 +593,11 @@ def main(_):
     value_model = ValueModel(dimension=dimension)
     value_model.to(accelerator.device)
 
-    for epoch in range(config.max_epochs):
+    if config.eval_freq > 0:
         pipeline.transformer.eval()
+        eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, reward_fn, autocast, num_train_timesteps, mu, sigma)
 
-        #################### EVAL ####################
-        if config.eval_freq > 0 and epoch % config.eval_freq == 0:
-            eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, reward_fn, autocast, num_train_timesteps, mu, sigma)
+    for epoch in range(config.max_epochs):
 
         #################### SAMPLING ####################
         noise, noise_projected = get_noise(mu, sigma, config.sample.train_batch_size, accelerator.device)
@@ -786,6 +790,11 @@ def main(_):
         sigma = accelerate.utils.broadcast(sigma)
 
         global_step += 1
+        #################### EVAL ####################
+        if config.eval_freq > 0 and (epoch+1) % config.eval_freq == 0:
+            eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, reward_fn, autocast, num_train_timesteps, mu, sigma)
+        
+        
 
 if __name__ == "__main__":
     app.run(main)

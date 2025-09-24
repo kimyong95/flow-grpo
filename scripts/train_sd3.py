@@ -64,14 +64,17 @@ class TextPromptDataset(Dataset):
         return len(self.prompts)
     
     def __getitem__(self, idx):
-        return {"prompt": self.prompts[idx], "metadata": {}}
-
+        return (idx, self.prompts[idx], {})
+    
     @staticmethod
-    def collate_fn(examples):
-        prompts = [example["prompt"] for example in examples]
-        metadatas = [example["metadata"] for example in examples]
-        return prompts, metadatas
-
+    def collate_fn(batch):
+        # batch: list of (idx, prompt_str, metadata_dict)
+        idxs, prompts, metas = zip(*batch)
+        idxs = list(idxs)
+        prompts = list(prompts)
+        metas = list(metas)
+        return idxs, prompts, metas
+    
 class GenevalPromptDataset(Dataset):
     def __init__(self, dataset, split='train'):
         self.file_path = os.path.join(dataset, f'{split}_metadata.jsonl')
@@ -83,13 +86,16 @@ class GenevalPromptDataset(Dataset):
         return len(self.prompts)
     
     def __getitem__(self, idx):
-        return {"prompt": self.prompts[idx], "metadata": self.metadatas[idx]}
+        return (idx, self.prompts[idx], self.metadatas[idx])
 
     @staticmethod
-    def collate_fn(examples):
-        prompts = [example["prompt"] for example in examples]
-        metadatas = [example["metadata"] for example in examples]
-        return prompts, metadatas
+    def collate_fn(batch):
+        # batch: list of (idx, prompt_str, metadata_dict)
+        idxs, prompts, metas = zip(*batch)
+        idxs = list(idxs)
+        prompts = list(prompts)
+        metas = list(metas)
+        return idxs, prompts, metas
 
 class DistributedKRepeatSampler(Sampler):
     def __init__(self, dataset, batch_size, k, num_replicas, rank, seed=0):
@@ -229,8 +235,8 @@ def compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, co
 
     return prev_sample, log_prob, prev_sample_mean, std_dev_t
 
-def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, reward_fn, autocast, num_train_timesteps, ema, transformer_trainable_parameters):
-    if config.train.ema:
+def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, epoch, reward_fn, autocast, num_train_timesteps, ema, transformer_trainable_parameters):
+    if config.train.ema and ema is not None:
         ema.copy_ema_to(transformer_trainable_parameters, store_temp=True)
     neg_prompt_embed, neg_pooled_prompt_embed = compute_text_embeddings([""], text_encoders, tokenizers, max_sequence_length=128, device=accelerator.device)
 
@@ -245,7 +251,7 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
             disable=not accelerator.is_local_main_process,
             position=0,
         ):
-        prompts, prompt_metadata = test_batch
+        prompts_idx, prompts, prompt_metadata = test_batch
         prompt_embeds, pooled_prompt_embeds = compute_text_embeddings(
             prompts, 
             text_encoders, 
@@ -257,6 +263,16 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
         if len(prompt_embeds)<len(sample_neg_prompt_embeds):
             sample_neg_prompt_embeds = sample_neg_prompt_embeds[:len(prompt_embeds)]
             sample_neg_pooled_prompt_embeds = sample_neg_pooled_prompt_embeds[:len(prompt_embeds)]
+        
+        load_eval_noise_path = config.get("load_eval_noise")
+        if load_eval_noise_path is not None:
+            eval_noise = torch.load(load_eval_noise_path, accelerator.device)[:,prompts_idx,:]
+            latents = eval_noise[0]
+            noise = eval_noise[1:]
+        else:
+            noise = None
+            latents = None
+        
         with autocast():
             with torch.no_grad():
                 images, _, _ = pipeline_with_logprob(
@@ -271,6 +287,8 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
                     height=config.resolution,
                     width=config.resolution, 
                     noise_level=0,
+                    latents=latents,
+                    noise=noise,
                 )
 
         rewards, reward_metadata = reward_fn(images, prompts, prompt_metadata, only_strict=False)
@@ -322,10 +340,11 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
                         for idx, (prompt, reward) in enumerate(zip(sampled_prompts, sampled_rewards))
                     ],
                     **{f"eval_reward_{key}": np.mean(value[value != -10]) for key, value in all_rewards.items()},
+                    "epoch": epoch,
                 },
                 step=global_step,
             )
-    if config.train.ema:
+    if config.train.ema and ema is not None:
         ema.copy_temp_to(transformer_trainable_parameters)
 
 def unwrap_model(model, accelerator):
@@ -375,6 +394,8 @@ def main(_):
     if accelerator.is_main_process:
         wandb.init(
             project="flow_grpo",
+            name=f"grpo-{config.run_name}",
+            config=config.to_dict(),
         )
         # accelerator.init_trackers(
         #     project_name="flow-grpo",
@@ -453,6 +474,8 @@ def main(_):
         else:
             pipeline.transformer = get_peft_model(pipeline.transformer, transformer_lora_config)
     
+    if config.gradient_checkpointing:
+        pipeline.transformer.enable_gradient_checkpointing()
     transformer = pipeline.transformer
     transformer_trainable_parameters = list(filter(lambda p: p.requires_grad, transformer.parameters()))
     # This ema setting affects the previous 20 × 8 = 160 steps on average.
@@ -609,14 +632,14 @@ def main(_):
 
     global_step = 0
     train_iter = iter(train_dataloader)
+    
+    if config.eval_freq > 0:
+        pipeline.transformer.eval()
+        eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, 0, reward_fn, autocast, num_train_timesteps,
+            ema=None, transformer_trainable_parameters=transformer_trainable_parameters, # No ema on first evaluation
+        )
 
     for epoch in range(config.max_epochs):
-        #################### EVAL ####################
-        pipeline.transformer.eval()
-        if config.eval_freq > 0 and epoch % config.eval_freq == 0:
-            eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, reward_fn, autocast, num_train_timesteps, ema, transformer_trainable_parameters)
-        if epoch % config.save_freq == 0 and epoch > 0 and accelerator.is_main_process:
-            save_ckpt(config.save_dir, transformer, global_step, accelerator, ema, transformer_trainable_parameters, config)
 
         #################### SAMPLING ####################
         pipeline.transformer.eval()
@@ -629,7 +652,7 @@ def main(_):
             position=0,
         ):
             train_sampler.set_epoch(epoch * config.sample.num_batches_per_epoch + i)
-            prompts, prompt_metadata = next(train_iter)
+            prompts_idx, prompts, prompt_metadata = next(train_iter)
 
             prompt_embeds, pooled_prompt_embeds = compute_text_embeddings(
                 prompts, 
@@ -965,6 +988,13 @@ def main(_):
             # make sure we did an optimization step at the end of the inner epoch
             # assert accelerator.sync_gradients
         
+        #################### EVAL ####################
+        if config.eval_freq > 0 and (epoch+1) % config.eval_freq == 0:
+            pipeline.transformer.eval()
+            eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, epoch+1, reward_fn, autocast, num_train_timesteps, ema, transformer_trainable_parameters)
+        if epoch % config.save_freq == 0 and epoch > 0 and accelerator.is_main_process:
+            save_ckpt(config.save_dir, transformer, global_step, accelerator, ema, transformer_trainable_parameters, config)
+
 if __name__ == "__main__":
     app.run(main)
 

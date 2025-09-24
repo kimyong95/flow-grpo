@@ -35,6 +35,7 @@ def pipeline_with_logprob(
     max_sequence_length: int = 256,
     skip_layer_guidance_scale: float = 2.8,
     noise_level: float = 0.7,
+    noise: Optional[torch.FloatTensor] = None,
 ):
     height = height or self.default_sample_size * self.vae_scale_factor
     width = width or self.default_sample_size * self.vae_scale_factor
@@ -164,6 +165,7 @@ def pipeline_with_logprob(
                 t.unsqueeze(0), 
                 latents.float(),
                 noise_level=noise_level,
+                noise=noise[i] if noise is not None else None,
             )
             latents = latents.to(latents_dtype)
             all_latents.append(latents)
