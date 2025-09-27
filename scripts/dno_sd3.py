@@ -1,3 +1,7 @@
+"""
+This is implementation for DNO, it will not support multi-GPU for simplicity.
+"""
+
 from collections import defaultdict
 import contextlib
 import os
@@ -313,7 +317,7 @@ def main(_):
     if accelerator.is_main_process:
         wandb.init(
             project="flow_grpo",
-            name=f"inference-{config.sample.selection_mode}-{config.run_name}",
+            name=f"dno-{config.run_name}",
             config=config.to_dict(),
         )
     logger.info(f"\n{config}")
@@ -328,13 +332,7 @@ def main(_):
     )
     pipeline.vae.enable_slicing()
     # freeze parameters of models to save more memory
-    pipeline.vae.requires_grad_(False)
-    pipeline.text_encoder.requires_grad_(False)
-    pipeline.text_encoder_2.requires_grad_(False)
-    pipeline.text_encoder_3.requires_grad_(False)
-    pipeline.transformer.requires_grad_(False)
-    if config.compile:
-        pipeline.transformer = torch.compile(pipeline.transformer)
+    [ module.requires_grad_(False) for module in pipeline.text_encoder.modules() if isinstance(module, torch.nn.Module) ]
     pipeline.transformer.eval()
 
     text_encoders = [pipeline.text_encoder, pipeline.text_encoder_2, pipeline.text_encoder_3]
@@ -361,6 +359,8 @@ def main(_):
 
     # Move to inference_dtype
     pipeline.to(accelerator.device, dtype=inference_dtype)
+    pipeline.vae.enable_gradient_checkpointing()
+    pipeline.transformer.enable_gradient_checkpointing()
     
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
@@ -377,7 +377,7 @@ def main(_):
         # Create an infinite-loop DataLoader
         train_sampler = DistributedKRepeatSampler( 
             dataset=train_dataset,
-            batch_size=config.sample.init_batch_size,
+            batch_size=config.sample.batch_size,
             k=config.sample.num_image_per_prompt,
             num_replicas=accelerator.num_processes,
             rank=accelerator.process_index,
@@ -399,7 +399,7 @@ def main(_):
 
         train_sampler = DistributedKRepeatSampler( 
             dataset=train_dataset,
-            batch_size=config.sample.init_batch_size,
+            batch_size=config.sample.batch_size,
             k=config.sample.num_image_per_prompt,
             num_replicas=accelerator.num_processes,
             rank=accelerator.process_index,
@@ -419,8 +419,8 @@ def main(_):
 
     neg_prompt_embed, neg_pooled_prompt_embed = compute_text_embeddings([""], text_encoders, tokenizers, max_sequence_length=128, device=accelerator.device)
 
-    sample_neg_prompt_embeds = neg_prompt_embed.repeat(config.sample.init_batch_size, 1, 1)
-    sample_neg_pooled_prompt_embeds = neg_pooled_prompt_embed.repeat(config.sample.init_batch_size, 1)
+    sample_neg_prompt_embeds = neg_prompt_embed.repeat(config.sample.batch_size, 1, 1)
+    sample_neg_pooled_prompt_embeds = neg_pooled_prompt_embed.repeat(config.sample.batch_size, 1)
 
     if config.sample.num_image_per_prompt == 1:
         config.per_prompt_stat_tracking = False
@@ -435,250 +435,126 @@ def main(_):
     # Prepare everything with our `accelerator`.
     train_dataloader = accelerator.prepare(train_dataloader)
 
-    # Train!
-    samples_per_epoch = (
-        config.sample.train_batch_size
-        * accelerator.num_processes
-        * config.sample.num_batches_per_epoch
-    )
-    total_train_batch_size = (
-        config.train.batch_size
-        * accelerator.num_processes
-        * config.train.gradient_accumulation_steps
-    )
-
-    logger.info("***** Running training *****")
-    logger.info(f"  Sample batch size per device = {config.sample.train_batch_size}")
-    logger.info(f"  Train batch size per device = {config.train.batch_size}")
-    logger.info(
-        f"  Gradient Accumulation steps = {config.train.gradient_accumulation_steps}"
-    )
-    logger.info("")
-    logger.info(f"  Total number of samples per epoch = {samples_per_epoch}")
-    logger.info(
-        f"  Total train batch size (w. parallel, distributed & accumulation) = {total_train_batch_size}"
-    )
-    logger.info(
-        f"  Number of gradient updates per inner epoch = {samples_per_epoch // total_train_batch_size}"
-    )
-    logger.info(f"  Number of inner epochs = {config.train.num_inner_epochs}")
-    # assert config.sample.train_batch_size >= config.train.batch_size
-    # assert config.sample.train_batch_size % config.train.batch_size == 0
-    # assert samples_per_epoch % total_train_batch_size == 0
-
-    epoch = 0
     global_step = 0
     train_iter = iter(train_dataloader)
-    
-    dimension = pipeline.transformer.config.in_channels * int(config.resolution/pipeline.vae_scale_factor) * int(config.resolution/pipeline.vae_scale_factor)
-    mu = torch.zeros((config.sample.num_steps, dimension), device=accelerator.device)
-    sigma = torch.ones((config.sample.num_steps, dimension), device=accelerator.device)
-
-    flatten = lambda x: einops.rearrange(x, "... c h w -> ... (c h w)", c=pipeline.transformer.config.in_channels, h=int(config.resolution/pipeline.vae_scale_factor), w=int(config.resolution/pipeline.vae_scale_factor))
-    unflatten = lambda x: einops.rearrange(x, "... (c h w) -> ... c h w", c=pipeline.transformer.config.in_channels, h=int(config.resolution/pipeline.vae_scale_factor), w=int(config.resolution/pipeline.vae_scale_factor))
-
-    value_model = ValueModel(dimension=dimension)
-    value_model.to(accelerator.device)
-
-    # b_t in the paper
-    batch_size_t = [
-        int( config.sample.init_batch_size * (config.sample.final_batch_size/config.sample.init_batch_size)**(t/config.sample.num_steps) )
-        for t in range(config.sample.num_steps)
-    ]
-
-    # w_t in the paper
-    expansion_size_t = [
-        int(config.sample.evaluation_budget // b_t)
-        for b_t in batch_size_t
-    ]
-
-    objective_evaluations = [
-        b*e
-        for b,e in zip(batch_size_t, expansion_size_t)
-    ]
-    objective_evaluations = torch.tensor(objective_evaluations).cumsum(dim=0)
-
-    batch_size_t.append(config.sample.final_batch_size)
     
     train_sampler.set_epoch(0)
     prompts_idx, prompts, prompt_metadata = next(train_iter)
 
     prompt_embeds, pooled_prompt_embeds = compute_text_embeddings(
-        [prompts[0]]*config.sample.init_batch_size, 
+        [prompts[0]]*config.sample.batch_size, 
         text_encoders, 
         tokenizers, 
         max_sequence_length=128, 
         device=accelerator.device
     )
 
-    def callback_fn(self, index, timestep, kwargs):
+    C_dim = pipeline.transformer.config.in_channels
+    H_dim = int(config.resolution/pipeline.vae_scale_factor)
+    W_dim = int(config.resolution/pipeline.vae_scale_factor)
 
-        timesteps = kwargs["timesteps"]
-        prev_latents_mean = kwargs["prev_latents_mean"]
-        std_dev_t = kwargs["std_dev_t"]
-        prompt_embeds = kwargs["prompt_embeds"]
-        prompt_embeds_base = torch.stack([prompt_embeds[0], prompt_embeds[-1]])
-        pooled_prompt_embeds = kwargs["pooled_prompt_embeds"]
-        pooled_prompt_embeds_base = torch.stack([pooled_prompt_embeds[0], pooled_prompt_embeds[-1]])
+    pipeline_with_logprob_grad = pipeline_with_logprob.__wrapped__
+
+    # 2D list, index by [optimization_id, sample_id]
+    all_images = [
+        [None for _ in range(config.sample.total_num_samples)]
+        for _ in range(config.optimization_steps+1)
+    ]
+    all_rewards = torch.zeros((config.optimization_steps + 1, config.sample.total_num_samples), device=accelerator.device, dtype=torch.float32)
+    
+    for sample_i in range(config.sample.total_num_samples):
         
-        prev_step_index = index + 1
-        sigma = pipeline.scheduler.sigmas[index].view(-1, *([1] * (len(prev_latents_mean.shape) - 1)))
-        sigma_prev = pipeline.scheduler.sigmas[prev_step_index].view(-1, *([1] * (len(prev_latents_mean.shape) - 1)))
-        sigma_max = pipeline.scheduler.sigmas[1].item()
-        dt = sigma_prev - sigma
-
-        batch_size = batch_size_t[index]
-        expansion_size = expansion_size_t[index]
-
-        prompt_embeds_expand = einops.repeat(
-            prompt_embeds_base,
-            '(two) ... -> (two m) ...', two=2, m = expansion_size,
-        )
-
-        pooled_prompt_embeds_expand = einops.repeat(
-            pooled_prompt_embeds_base,
-            '(two) ... -> (two m) ...', two=2, m = expansion_size,
-        )
+        ref_noise = torch.randn((config.sample.num_steps + 1, C_dim, H_dim, W_dim), device=accelerator.device, requires_grad=True)
+        optimizer = torch.optim.AdamW([ref_noise], lr=0.01, weight_decay=0.0)
         
-        prev_sample_candidates = []
-        prev_sample_candidates_rewards = []
-        images_candinates = []
-        for i, prev_latents_mean_i in enumerate(prev_latents_mean):
-            
-            # sample
-            noise_i = randn_tensor((expansion_size,) + tuple(prev_latents_mean_i.shape), dtype=prev_latents_mean_i.dtype, device=prev_latents_mean_i.device)
-            prev_sample_i = prev_latents_mean_i + std_dev_t * torch.sqrt(-1*dt) * noise_i
-            pred_sample_i = sample_one_step(
-                self,
-                latents=prev_sample_i,
-                t=timesteps[prev_step_index],
-                prompt_embeds=prompt_embeds_expand,
-                pooled_prompt_embeds=pooled_prompt_embeds_expand,
-            ) if prev_step_index < len(timesteps) else prev_sample_i
-            prev_sample_candidates.append(prev_sample_i.to(self.transformer.dtype))
-            
-            # evaluate
-            images_i = latents_to_images(self, pred_sample_i, output_type="pt")
-            images_candinates.append(images_i)
-            rewards_i, rewards_meta_i = reward_fn(images_i, [prompts[0]] * expansion_size, [prompt_metadata[0]] * expansion_size)
-            prev_sample_candidates_rewards.append(torch.tensor(rewards_i["avg"]))
+        # +1 because we want to log the ref_images after last noise update
+        for optimization_i in range(config.optimization_steps+1):
+            with autocast():
+                ref_image, _, _, _ = pipeline_with_logprob_grad(
+                    pipeline,
+                    prompt_embeds=prompt_embeds[:1],
+                    pooled_prompt_embeds=pooled_prompt_embeds[:1],
+                    negative_prompt_embeds=sample_neg_prompt_embeds[:1],
+                    negative_pooled_prompt_embeds=sample_neg_pooled_prompt_embeds[:1],
+                    num_inference_steps=config.sample.num_steps,
+                    guidance_scale=config.sample.guidance_scale,
+                    output_type="pt",
+                    height=config.resolution,
+                    width=config.resolution, 
+                    noise_level=config.sample.noise_level,
+                    latents=ref_noise[0].unsqueeze(0),
+                    noise=ref_noise[1:].unsqueeze(1),
+                )
+                ref_image = ref_image[0].to(accelerator.device, dtype=torch.float32)
+                
+                with torch.no_grad():
+                    noise = einops.repeat(ref_noise.detach(), "T ... -> T B ...", B=config.sample.batch_size)
+                    noise = noise + torch.randn_like(noise) * 0.01
+                    images, _, _, _ = pipeline_with_logprob(
+                        pipeline,
+                        prompt_embeds=prompt_embeds,
+                        pooled_prompt_embeds=pooled_prompt_embeds,
+                        negative_prompt_embeds=sample_neg_prompt_embeds,
+                        negative_pooled_prompt_embeds=sample_neg_pooled_prompt_embeds,
+                        num_inference_steps=config.sample.num_steps,
+                        guidance_scale=config.sample.guidance_scale,
+                        output_type="pt",
+                        height=config.resolution,
+                        width=config.resolution, 
+                        noise_level=config.sample.noise_level,
+                        latents=noise[0],
+                        noise=noise[1:],
+                    )
+                images = images.to(accelerator.device, dtype=torch.float32)
+                
+            # reward
+            ref_rewards, reward_metadata = reward_fn(ref_image.detach().unsqueeze(0), [prompts[0]], [prompt_metadata[0]], only_strict=True)
+            ref_rewards = torch.tensor(ref_rewards["avg"]).to(accelerator.device)
+            rewards, reward_metadata = reward_fn(images, prompts, prompt_metadata, only_strict=True)
+            rewards = torch.tensor(rewards["avg"]).to(accelerator.device)
 
-        # selection
-        next_batch_size = batch_size_t[index+1]
+            # optimization
+            ref_loss, losses = -ref_rewards, -rewards
+            with torch.no_grad():
+                est_grad = torch.zeros_like(ref_image)
+                for i in range(config.sample.batch_size):
+                    est_grad += (losses[i] - ref_loss) * (images[i] - ref_image)
+                est_grad /= (torch.norm(est_grad) + 1e-3)
+            loss = torch.sum(est_grad * ref_image)
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
 
-        if config.sample.selection_mode == "d-search":
-            prev_sample_candidates = torch.stack(prev_sample_candidates)
-            prev_sample_candidates_rewards = torch.stack(prev_sample_candidates_rewards)
+            all_images[optimization_i][sample_i] = ref_image.detach()
+            all_rewards[optimization_i][sample_i] = ref_rewards
 
-            # instance-wise best
-            best_indices = prev_sample_candidates_rewards.argmax(dim=1)
-            prev_sample_rewards = prev_sample_candidates_rewards[torch.arange(len(best_indices)), best_indices]
-            prev_sample = prev_sample_candidates[torch.arange(len(prev_sample_candidates)), best_indices]
-            images = [images_candinates[i][best_indices[i]] for i in range(len(best_indices))]
-
-            # global selection
-            next_indices = prev_sample_rewards.topk(next_batch_size).indices
-            prev_sample_rewards = prev_sample_rewards[next_indices]
-            prev_sample = prev_sample[next_indices]
-            images = [images[idx] for idx in next_indices]
-
-        elif config.sample.selection_mode == "tree-g":
-            # flatten
-            prev_sample_candidates = torch.cat(prev_sample_candidates, dim=0)
-            prev_sample_candidates_rewards = torch.cat(prev_sample_candidates_rewards, dim=0)
-            images_candinates = [img for imgs in images_candinates for img in imgs]
-
-            # global selection
-            next_indices = prev_sample_candidates_rewards.topk(next_batch_size).indices
-            prev_sample_rewards = prev_sample_candidates_rewards[next_indices]
-            prev_sample = prev_sample_candidates[next_indices]
-            images = [images_candinates[idx] for idx in next_indices]
-
-        prompt_embeds = einops.repeat(prompt_embeds_base, '(two) ... -> (two b) ...', two=2, b = next_batch_size)
-        pooled_prompt_embeds = einops.repeat(pooled_prompt_embeds_base, '(two) ... -> (two b) ...', two=2, b = next_batch_size)
-        
-
+    for optimization_i in range(config.optimization_steps+1):
         with tempfile.TemporaryDirectory() as tmpdir:
-            for i in range(len(images)):
-                image = images[i]
+            for sample_i in range(config.sample.total_num_samples):
+                image = all_images[optimization_i][sample_i]
                 pil = Image.fromarray(
                     (image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
                 )
                 pil = pil.resize((config.resolution, config.resolution))
-                pil.save(os.path.join(tmpdir, f"{i}.jpg"))
+                pil.save(os.path.join(tmpdir, f"{sample_i}.jpg"))
 
+            wandb_images = [
+                wandb.Image(
+                    os.path.join(tmpdir, f"{idx}.jpg"),
+                    caption=f"{prompts[0]} | reward: {reward:.2f}",
+                )
+                for idx, reward in enumerate(all_rewards[optimization_i].cpu().numpy().tolist())
+            ]
             wandb.log(
                 {
-                    "images": [
-                        wandb.Image(
-                            os.path.join(tmpdir, f"{idx}.jpg"),
-                            caption=f"{prompts[0]} | avg: {avg_reward:.2f}",
-                        )
-                        for idx, avg_reward in enumerate(prev_sample_rewards)
-                    ],
-                    "objective_evaluations": objective_evaluations[index],
-                    f"reward_{config.reward_fn.keys()[0]}": prev_sample_rewards.mean(),
-                    f"reward_avg": prev_sample_rewards.mean(),
+                    f"images": wandb_images,
+                    "objective_evaluations": config.sample.total_num_samples * config.sample.batch_size * optimization_i,
+                    f"reward_{config.reward_fn.keys()[0]}": all_rewards[optimization_i].mean(),
+                    f"reward_avg": all_rewards[optimization_i].mean(),
+                    **({"final_images": wandb_images} if (optimization_i) == config.optimization_steps else {}),
                 },
-                step=index,
+                step=optimization_i,
             )
-
-        return {
-            "latents": prev_sample,
-            "prompt_embeds": prompt_embeds,
-            "pooled_prompt_embeds": pooled_prompt_embeds,
-        }
-
-    with autocast():
-        with torch.inference_mode():
-            
-            callback_fn_inputs = ["timesteps", "prev_latents_mean", "std_dev_t", "prompt_embeds", "pooled_prompt_embeds"]
-            pipeline._callback_tensor_inputs.extend(callback_fn_inputs)
-            images, latents, log_probs, pred_samples = pipeline_with_logprob(
-                pipeline,
-                prompt_embeds=prompt_embeds,
-                pooled_prompt_embeds=pooled_prompt_embeds,
-                negative_prompt_embeds=sample_neg_prompt_embeds,
-                negative_pooled_prompt_embeds=sample_neg_pooled_prompt_embeds,
-                num_inference_steps=config.sample.num_steps,
-                guidance_scale=config.sample.guidance_scale,
-                output_type="pt",
-                height=config.resolution,
-                width=config.resolution, 
-                noise_level=config.sample.noise_level,
-                callback_on_step_end=callback_fn,
-                callback_on_step_end_tensor_inputs=callback_fn_inputs,
-            )
-            images = images.to(accelerator.device, dtype=torch.float32)
-
-    rewards, rewards_meta = reward_fn(
-        images,
-        [prompts[0]]*config.sample.final_batch_size,
-        [prompt_metadata[0]]*config.sample.final_batch_size,
-    )
-
-    pil_images = [
-        Image.fromarray(
-            (image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
-        ).resize((config.resolution, config.resolution))
-        for image in images
-    ]    
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        wandb.log(
-            {
-                "eval_images": [
-                    wandb.Image(
-                        image,
-                        caption=f"{prompts[0]} | avg: {avg_reward:.2f}",
-                    )
-                    for image, avg_reward in zip(pil_images, rewards["avg"])
-                ],
-                "objective_evaluations": objective_evaluations[-1],
-                **{f"eval_reward_{key}": torch.tensor(value).mean() for key, value in rewards.items()},
-            },
-            step=global_step,
-        )
 
 if __name__ == "__main__":
     app.run(main)

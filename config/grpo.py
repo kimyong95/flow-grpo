@@ -362,11 +362,22 @@ def pickscore_sd3_4gpu():
 def prompt_alignment_sd3_1gpu():
     gpu_number=1
     config = general_ocr_sd3_1gpu()
+    config.max_epochs = 100
+    config.load_eval_noise = "dataset/eval_noise/tensor.pt"
+    config.eval_freq = 10
+    config.gradient_checkpointing = False
+
+    # effective batch size = 64
+    config.sample.test_batch_size = 32
+    config.sample.train_batch_size = 8
+    config.sample.num_batches_per_epoch = 8
+    config.sample.num_image_per_prompt = config.sample.train_batch_size
+
+    config.train.batch_size = config.sample.train_batch_size
+    config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch//2
 
     config.run_name = "prompt-alignment"
-    config.reward_fn = {
-        "gemma": 1.0,
-    }
+    config.reward_fn = {"gemini": 1.0}
     config.dataset = os.path.join(os.getcwd(), "dataset/prompt_align_1")
     return config
 
@@ -410,7 +421,6 @@ def general_ocr_sd3_1gpu():
 
     config.per_prompt_stat_tracking = True
     return config
-
 
 def pickscore_flux():
     gpu_number=32

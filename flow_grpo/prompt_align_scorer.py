@@ -195,7 +195,7 @@ class GeminiScorer:
 
         self.answer_pattern = re.compile(r"@answer=(\d+)")
 
-    @retry(times=5, failed_return=(0.0, "Error", "Error"), exceptions=(ServerError, ValueError, httpcore.ProtocolError))
+    @retry(times=5, failed_return=(0.0, "Error", "Error"), exceptions=(ServerError, ValueError, httpcore.ProtocolError, httpcore.ConnectError))
     def _score_single(self, pil_img, prompt, retry_attempt):
         """Performs the two-pass scoring for a single image."""
         client = genai.Client()

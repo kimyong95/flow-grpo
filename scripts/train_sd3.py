@@ -235,7 +235,7 @@ def compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, co
 
     return prev_sample, log_prob, prev_sample_mean, std_dev_t
 
-def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, epoch, reward_fn, autocast, num_train_timesteps, ema, transformer_trainable_parameters):
+def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, epoch, reward_fn, autocast, num_train_timesteps, ema, transformer_trainable_parameters, noise_level=0.0):
     if config.train.ema and ema is not None:
         ema.copy_ema_to(transformer_trainable_parameters, store_temp=True)
     neg_prompt_embed, neg_pooled_prompt_embed = compute_text_embeddings([""], text_encoders, tokenizers, max_sequence_length=128, device=accelerator.device)
@@ -244,7 +244,10 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
     sample_neg_pooled_prompt_embeds = neg_pooled_prompt_embed.repeat(config.sample.test_batch_size, 1)
 
     # test_dataloader = itertools.islice(test_dataloader, 2)
-    all_rewards = defaultdict(list)
+    all_rewards = []
+    all_images = []
+    all_prompts = []
+    
     for test_batch in tqdm(
             test_dataloader,
             desc="Eval: ",
@@ -263,7 +266,7 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
         if len(prompt_embeds)<len(sample_neg_prompt_embeds):
             sample_neg_prompt_embeds = sample_neg_prompt_embeds[:len(prompt_embeds)]
             sample_neg_pooled_prompt_embeds = sample_neg_pooled_prompt_embeds[:len(prompt_embeds)]
-        
+
         load_eval_noise_path = config.get("load_eval_noise")
         if load_eval_noise_path is not None:
             eval_noise = torch.load(load_eval_noise_path, accelerator.device)[:,prompts_idx,:]
@@ -272,7 +275,6 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
         else:
             noise = None
             latents = None
-        
         with autocast():
             with torch.no_grad():
                 images, _, _ = pipeline_with_logprob(
@@ -286,60 +288,56 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
                     output_type="pt",
                     height=config.resolution,
                     width=config.resolution, 
-                    noise_level=0,
+                    noise_level=noise_level,
                     latents=latents,
                     noise=noise,
                 )
-
+                images = images.to(accelerator.device, dtype=torch.float32)
         rewards, reward_metadata = reward_fn(images, prompts, prompt_metadata, only_strict=False)
-
-        for key, value in rewards.items():
-            rewards_gather = accelerator.gather(torch.as_tensor(value, device=accelerator.device)).cpu().numpy()
-            all_rewards[key].append(rewards_gather)
+        
+        all_rewards.append(rewards)
+        all_images.append(images)
+        all_prompts.extend(prompts)
     
-    last_batch_images_gather = accelerator.gather(torch.as_tensor(images, device=accelerator.device)).cpu().numpy()
-    last_batch_prompt_ids = tokenizers[0](
-        prompts,
+    
+    prompts_ids = tokenizers[0](
+        all_prompts,
         padding="max_length",
         max_length=256,
         truncation=True,
         return_tensors="pt",
     ).input_ids.to(accelerator.device)
-    last_batch_prompt_ids_gather = accelerator.gather(last_batch_prompt_ids).cpu().numpy()
-    last_batch_prompts_gather = pipeline.tokenizer.batch_decode(
-        last_batch_prompt_ids_gather, skip_special_tokens=True
+    gathered_prompts_ids = accelerator.gather(prompts_ids).cpu().numpy()
+    gathered_prompts = pipeline.tokenizer.batch_decode(
+        gathered_prompts_ids, skip_special_tokens=True
     )
-    last_batch_rewards_gather = {}
-    for key, value in rewards.items():
-        last_batch_rewards_gather[key] = accelerator.gather(torch.as_tensor(value, device=accelerator.device)).cpu().numpy()
 
-    all_rewards = {key: np.concatenate(value) for key, value in all_rewards.items()}
+    gathered_images = accelerator.gather(torch.concat(all_images))
+    
+    all_rewards = {k: torch.cat([torch.tensor(d[k], device=accelerator.device) for d in all_rewards], dim=0) for k in all_rewards[0]}
+    gathered_rewards = {key: accelerator.gather(value) for key, value in all_rewards.items()}
+
     if accelerator.is_main_process:
         with tempfile.TemporaryDirectory() as tmpdir:
-            num_samples = min(15, len(last_batch_images_gather))
-            # sample_indices = random.sample(range(len(images)), num_samples)
-            sample_indices = range(num_samples)
-            for idx, index in enumerate(sample_indices):
-                image = last_batch_images_gather[index]
+            for i in range(len(gathered_images)):
+                image = gathered_images[i]
                 pil = Image.fromarray(
-                    (image.transpose(1, 2, 0) * 255).astype(np.uint8)
+                    (image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
                 )
                 pil = pil.resize((config.resolution, config.resolution))
-                pil.save(os.path.join(tmpdir, f"{idx}.jpg"))
-            sampled_prompts = [last_batch_prompts_gather[index] for index in sample_indices]
-            sampled_rewards = [{k: last_batch_rewards_gather[k][index] for k in last_batch_rewards_gather} for index in sample_indices]
-            for key, value in all_rewards.items():
-                print(key, value.shape)
+                pil.save(os.path.join(tmpdir, f"{i}.jpg"))
+            eval_suffix = f"_noisy" if noise_level > 0.0 else ""
+
             wandb.log(
                 {
-                    "eval_images": [
+                    f"eval{eval_suffix}_images": [
                         wandb.Image(
                             os.path.join(tmpdir, f"{idx}.jpg"),
-                            caption=f"{prompt:.1000} | " + " | ".join(f"{k}: {v:.2f}" for k, v in reward.items() if v != -10),
+                            caption=f"{prompt} | avg: {avg_reward:.2f}",
                         )
-                        for idx, (prompt, reward) in enumerate(zip(sampled_prompts, sampled_rewards))
+                        for idx, (prompt, avg_reward) in enumerate(zip(gathered_prompts, gathered_rewards["avg"]))
                     ],
-                    **{f"eval_reward_{key}": np.mean(value[value != -10]) for key, value in all_rewards.items()},
+                    **{f"eval{eval_suffix}_reward_{key}": value.mean() for key, value in gathered_rewards.items()},
                     "epoch": epoch,
                 },
                 step=global_step,
@@ -635,10 +633,10 @@ def main(_):
     
     if config.eval_freq > 0:
         pipeline.transformer.eval()
-        eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, 0, reward_fn, autocast, num_train_timesteps,
-            ema=None, transformer_trainable_parameters=transformer_trainable_parameters, # No ema on first evaluation
-        )
-
+        eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, 0, reward_fn, autocast, num_train_timesteps, ema, transformer_trainable_parameters)
+        
+        # extra eval to produce exactly same image as noise optimization
+        eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, 0, reward_fn, autocast, num_train_timesteps, ema=None, transformer_trainable_parameters=None, noise_level=0.7)
     for epoch in range(config.max_epochs):
 
         #################### SAMPLING ####################
@@ -992,6 +990,8 @@ def main(_):
         if config.eval_freq > 0 and (epoch+1) % config.eval_freq == 0:
             pipeline.transformer.eval()
             eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, epoch+1, reward_fn, autocast, num_train_timesteps, ema, transformer_trainable_parameters)
+            # extra eval to produce exactly same image as noise optimization
+            eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, epoch+1, reward_fn, autocast, num_train_timesteps, ema, transformer_trainable_parameters, noise_level=0.7)
         if epoch % config.save_freq == 0 and epoch > 0 and accelerator.is_main_process:
             save_ckpt(config.save_dir, transformer, global_step, accelerator, ema, transformer_trainable_parameters, config)
 

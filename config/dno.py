@@ -6,44 +6,39 @@ base = imp.load_source("base", os.path.join(os.path.dirname(__file__), "base.py"
 
 def compressibility():
     config = base.get_config()
-    config.max_epochs = 200
-    config.eval_freq = 10
 
     config.run_name = "compressibility"
     config.compile = True
 
     config.pretrained.model = "stabilityai/stable-diffusion-3.5-medium"
     config.sample.num_steps = 40
-    config.sample.eval_num_steps = 40
     config.sample.guidance_scale = 4.5
     config.resolution = 512
 
-    config.sample.num_batches_per_epoch = 1
-    config.sample.train_batch_size = 32
-    config.sample.test_batch_size = 32
-
     config.dataset = os.path.join(os.getcwd(), "dataset/pickscore")
-
     config.prompt_fn = "general_ocr"
-
     config.reward_fn = {"jpeg_compressibility": 1}
 
     return config
 
 def prompt_align():
     config = compressibility()
+
     config.run_name = "prompt-align"
 
     # dataset + prompting
     config.dataset = os.path.join(os.getcwd(), "dataset/prompt_align_1")
-    config.prompt_fn = "general_ocr"
+
+    # total objective evaluations: 40*32*(4+1)=6400
+    config.optimization_steps = 40
+    config.sample.total_num_samples = 32
+    config.sample.batch_size = 4 # number of samples for gradient estimation, it is equal to q in the paper
 
     # rewards
     config.reward_fn = {"gemini": 1.0}
 
     return config
 
-    return config
 
 def get_config(name):
     return globals()[name]()

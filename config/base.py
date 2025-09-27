@@ -97,6 +97,9 @@ def get_config():
     # save ema model
     train.ema = False
 
+    train.lora_rank = 32
+    train.lora_alpha = 64
+
     ###### Prompt Function ######
     # prompt function to use. see `prompts.py` for available prompt functions.
     config.prompt_fn = "imagenet_animals"
