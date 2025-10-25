@@ -332,7 +332,7 @@ def main(_):
     )
     pipeline.vae.enable_slicing()
     # freeze parameters of models to save more memory
-    [ module.requires_grad_(False) for module in pipeline.text_encoder.modules() if isinstance(module, torch.nn.Module) ]
+    [ comp.requires_grad_(False) for comp in pipeline.components.values() if isinstance(comp, torch.nn.Module) ] # disable all gradients
     pipeline.transformer.eval()
 
     text_encoders = [pipeline.text_encoder, pipeline.text_encoder_2, pipeline.text_encoder_3]
@@ -462,9 +462,13 @@ def main(_):
     ]
     all_rewards = torch.zeros((config.optimization_steps + 1, config.sample.total_num_samples), device=accelerator.device, dtype=torch.float32)
     
+    eval_noise = torch.load("dataset/eval_noise/tensor.pt", accelerator.device)
+
     for sample_i in range(config.sample.total_num_samples):
         
-        ref_noise = torch.randn((config.sample.num_steps + 1, C_dim, H_dim, W_dim), device=accelerator.device, requires_grad=True)
+        ref_noise = eval_noise[:,sample_i].clone().to(accelerator.device)
+        ref_noise.requires_grad = True
+
         optimizer = torch.optim.AdamW([ref_noise], lr=0.01, weight_decay=0.0)
         
         # +1 because we want to log the ref_images after last noise update
@@ -548,7 +552,7 @@ def main(_):
             wandb.log(
                 {
                     f"images": wandb_images,
-                    "objective_evaluations": config.sample.total_num_samples * config.sample.batch_size * optimization_i,
+                    "objective_evaluations": config.sample.total_num_samples * (config.sample.batch_size+1) * optimization_i,
                     f"reward_{config.reward_fn.keys()[0]}": all_rewards[optimization_i].mean(),
                     f"reward_avg": all_rewards[optimization_i].mean(),
                     **({"final_images": wandb_images} if (optimization_i) == config.optimization_steps else {}),

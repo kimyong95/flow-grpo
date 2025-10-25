@@ -365,7 +365,6 @@ def prompt_alignment_sd3_1gpu():
     config.max_epochs = 100
     config.load_eval_noise = "dataset/eval_noise/tensor.pt"
     config.eval_freq = 10
-    config.gradient_checkpointing = False
 
     # effective batch size = 64
     config.sample.test_batch_size = 32

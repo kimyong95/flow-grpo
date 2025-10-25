@@ -99,6 +99,7 @@ def get_config():
 
     train.lora_rank = 32
     train.lora_alpha = 64
+    config.gradient_checkpointing = False
 
     ###### Prompt Function ######
     # prompt function to use. see `prompts.py` for available prompt functions.
