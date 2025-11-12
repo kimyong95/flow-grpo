@@ -42,13 +42,6 @@ plot_data = {}
 
 ##################### load data ######################
 
-score_key_map = {
-    "optimize": "reward_gemini",
-    "grpo":     "reward_gemini",
-    "d-search": "reward_gemini",
-    "dno":      "reward_gemini",
-    "tree-g":   "reward_gemini",
-}
 max_objective_evaluations = 6400
 for algo in algos:
     for prompt_id in prompt_ids:
