@@ -6,6 +6,7 @@ import functools
 import concurrent.futures as futures
 from PIL import Image
 import torch
+import httpx
 from transformers import AutoProcessor, Gemma3nForConditionalGeneration
 from typing import List
 from google import genai
@@ -195,7 +196,7 @@ class GeminiScorer:
 
         self.answer_pattern = re.compile(r"@answer=(\d+)")
 
-    @retry(times=5, failed_return=(0.0, "Error", "Error"), exceptions=(ServerError, ValueError, httpcore.ProtocolError, httpcore.ConnectError))
+    @retry(times=5, failed_return=(0.0, "Error", "Error"), exceptions=(ServerError, ValueError, httpcore.ProtocolError, httpcore.NetworkError, httpx.ConnectError))
     def _score_single(self, pil_img, prompt, retry_attempt):
         """Performs the two-pass scoring for a single image."""
         client = genai.Client()
